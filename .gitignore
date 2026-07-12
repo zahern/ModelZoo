@@ -1,0 +1,5 @@
+.venv/
+generated_jobs/
+__pycache__/
+*.pyc
+streamlit_log.txt

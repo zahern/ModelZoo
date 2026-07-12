@@ -1,0 +1,11 @@
+Link the SearchLibriym and MetacouintRegoressor package
+
+and code from Z:/test_runs_tours/code so we have a full search ABM model.
+
+The purpose of this gui is to run models directly from the gui throuhg construcuted funcitonalitiy. Ie for btoh searchlibirum and metacoutnregressor, load int eh varaibles, click the thinkgs to do a specific kidn of search and settings, and get it to run in console with efficient looking good outputs on finish. also make it possibleso it cann straight up create hpc files and script to seach.
+
+#then for the abm component. link in the a gui that helps to setup all the files to run. 
+
+it needs a population make sure it chooses zoen size -> skims, etc make sure it asks for key specific info, and does smoke tests to show its compativible. 
+
+once it does all the checks for the files, compile the mdoel to run the whole piplein on the hpcs
