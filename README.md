@@ -16,11 +16,65 @@ a standalone `.py` script and shells out to the engine interpreter, streaming it
 into a console panel. The same generated script is what gets bundled into the HPC job export
 (paired with a PBS job file matching this project's cluster conventions).
 
-## Run
+## Getting started
+
+### Prerequisites
+
+- **Python 3.10+** to run the GUI itself (only needs `streamlit` + `pandas` — see
+  [requirements.txt](requirements.txt)).
+- **An "engine" Python interpreter** with `SearchLibrium`, `metacountregressor`, and `jax`
+  installed. This is a *separate* interpreter from the one running the GUI — see
+  [Architecture](#architecture) above. If you don't have one yet:
+
+  ```powershell
+  python -m venv engine-venv
+  engine-venv\Scripts\pip install SearchLibrium metacountregressor jax jaxlib jaxopt
+  ```
+
+  If you're working from the QUT SEQ ABM pipeline, the engine venv already exists at
+  `Z:\test_runs_tours\code\.venv` (or the equivalent path on your machine) — that's the
+  default the app sidebar starts with.
+- **The ABM pipeline code directory** (only needed for the ABM page) — defaults to
+  `Z:\test_runs_tours\code`; point the page at a different path if yours lives elsewhere.
+
+### 1. Clone and set up the GUI's own environment
+
+```powershell
+git clone https://github.com/zahern/ModelZoo.git
+cd ModelZoo
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+```
+
+### 2. Launch
 
 ```powershell
 .venv\Scripts\python.exe -m streamlit run app\Home.py
 ```
+
+Streamlit prints a local URL (defaults to `http://localhost:8501`) — open it in a browser.
+Running headless on a remote box (no browser to auto-open)? Add
+`--server.headless true --server.port 8501` to the command above.
+
+### 3. Point it at your engine interpreter
+
+On the **Home** page, the sidebar has an "Engine Python interpreter" field, prefilled with the
+default engine venv path. Change it if yours lives elsewhere, then click **Check engine** — it
+imports SearchLibrium/metacountregressor/JAX in that interpreter (first check can take
+30-90s, mostly JAX) and shows a pass/fail grid per package.
+
+### 4. Try a page
+
+Each of the three tool pages (**SearchLibrium**, **MetaCountRegressor**, **ABM Pipeline**) follows
+the same shape: configure → preview the generated script/command → **Run locally now** (streams
+console output live) or export an HPC job. The fastest way to see it work end-to-end without
+any of your own data: open the **SearchLibrium** or **MetaCountRegressor** page and pick
+"Bundled example dataset" / "Bundled Example 16-3 dataset" as the data source, leave the
+defaults, and click **Run locally now**.
+
+### Stopping the app
+
+Ctrl+C in the terminal running `streamlit run`, or close the terminal/process.
 
 ## Layout
 
@@ -56,10 +110,13 @@ the GA parallel stage fan-out chain) matching PBS_RUN_GUIDE.md in the code direc
 
 ## Notes on package API surface
 
-Both packages ship READMEs that are ahead of what's actually importable in the installed
-versions pinned in the engine venv (SearchLibrium 0.0.128, metacountregressor 1.0.88) — e.g.
-SearchLibrium's "bundled datasets" aren't in the installed wheel, and
-`ExperimentBuilder.run()` returns a plain `dict` (not an object with `.best_score`), so the
-generated metacountregressor scripts go through the documented `extract_search_best()` /
-`extract_summary()` / `evaluator.build_spec()` helpers instead. If you upgrade either package,
-re-check `app/lib/script_gen.py` against the new signatures before trusting generated scripts.
+Both packages' READMEs have occasionally been ahead of what's actually importable in a given
+installed version — e.g. `ExperimentBuilder.run()` returns a plain `dict` (not an object with
+`.best_score`), so the generated metacountregressor scripts go through the documented
+`extract_search_best()` / `extract_summary()` / `evaluator.build_spec()` helpers instead.
+SearchLibrium's bundled example datasets (`load_electricity_data()`, `load_travel_mode_data()`,
+`load_swiss_metro_data()`) were added to the SearchLibrium source but, as of this writing, not
+yet published to PyPI — install from source (`pip install -e path/to/SearchLibrium`) in the
+engine venv to use the "Bundled example dataset" option on that page; otherwise use "Upload CSV"
+/ "Path on disk" instead until a release ships it. If you upgrade either package, re-check
+`app/lib/script_gen.py` against the new signatures before trusting generated scripts.
