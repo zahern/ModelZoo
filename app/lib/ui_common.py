@@ -13,6 +13,70 @@ from lib.runner import stream_run
 JOBS_ROOT = Path(__file__).resolve().parent.parent.parent / "generated_jobs"
 
 
+def render_exclusive_groups(key_prefix: str, options: list[str], help_text: str = "") -> list[list[str]]:
+    """Dashboard widget for building a list of 'mutually exclusive' variable
+    groups (at most one variable per group may appear in the search). Shared
+    by the SearchLibrium and metacountregressor constraint dashboards — both
+    packages support the same shape (a list of 2+-variable groups).
+    """
+    state_key = f"{key_prefix}_groups"
+    st.session_state.setdefault(state_key, [])
+    groups: list[list[str]] = st.session_state[state_key]
+
+    if groups:
+        for i, g in enumerate(groups):
+            c1, c2 = st.columns([6, 1])
+            c1.code(" OR ".join(g), language="text")
+            if c2.button("Remove", key=f"{key_prefix}_rm_{i}"):
+                groups.pop(i)
+                st.rerun()
+
+    pick_key = f"{key_prefix}_new_group"
+    new_group = st.multiselect(
+        "Add a group (pick 2+ variables — at most one may appear together)",
+        options, key=pick_key, help=help_text,
+    )
+    if st.button("Add group", key=f"{key_prefix}_add_group", disabled=len(new_group) < 2):
+        groups.append(new_group)
+        del st.session_state[pick_key]
+        st.rerun()
+
+    return groups
+
+
+def render_pool_rules(
+    key_prefix: str, options: list[str], *, min_default: int = 2,
+    help_text: str = "",
+) -> list[dict]:
+    """Dashboard widget for 'require at least N variables from this pool'
+    rules (SearchLibrium's min_behavioral) — a list of {min, pool} dicts.
+    """
+    state_key = f"{key_prefix}_pools"
+    st.session_state.setdefault(state_key, [])
+    pools: list[dict] = st.session_state[state_key]
+
+    if pools:
+        for i, rule in enumerate(pools):
+            c1, c2 = st.columns([6, 1])
+            c1.code(f"at least {rule['min']} of: {', '.join(rule['pool'])}", language="text")
+            if c2.button("Remove", key=f"{key_prefix}_pool_rm_{i}"):
+                pools.pop(i)
+                st.rerun()
+
+    c1, c2 = st.columns([1, 4])
+    with c1:
+        min_count = st.number_input("Min count", 1, 10, min_default, key=f"{key_prefix}_min")
+    with c2:
+        pick_key = f"{key_prefix}_new_pool"
+        new_pool = st.multiselect("Pool", options, key=pick_key, help=help_text)
+    if st.button("Add rule", key=f"{key_prefix}_add_pool", disabled=len(new_pool) < int(min_count)):
+        pools.append({"min": int(min_count), "pool": new_pool})
+        del st.session_state[pick_key]
+        st.rerun()
+
+    return pools
+
+
 def _job_dir(prefix: str) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     d = JOBS_ROOT / f"{prefix}_{stamp}"

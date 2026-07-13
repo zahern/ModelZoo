@@ -123,6 +123,24 @@ Local runs stream the pipeline console into the page. The HPC tab renders ready-
 `qsub` / `submit_pipeline_runs.sh` commands (single mode, sequential batch, safety chain, and
 the GA parallel stage fan-out chain) matching PBS_RUN_GUIDE.md in the code directory.
 
+## Constraints dashboards
+
+Both the **SearchLibrium** and **MetaCountRegressor** pages have a "Constraints" section that
+maps onto each package's real constraint-builder API — including **mutually-exclusive groups**
+(pick 2+ variables, at most one may appear in the search's final structure):
+
+- **SearchLibrium** → `ConstraintBuilder`: force include / never include, mutually-exclusive
+  groups, minimum-behavioural-content pools, force/exclude random parameters (with a
+  distribution picker).
+- **MetaCountRegressor** → `ModelConstraints`: force include/fixed, never random, never
+  zero-inflation, exclude, membership-only/allow-membership/outcome-only, allow-random with a
+  restricted distribution set, and mutual-exclusion groups. Note: due to a verified upstream
+  limitation, `ModelConstraints` is only merged into the search for `model_family='count'` —
+  the page shows a warning if you pick `duration`/`linear` with constraints set.
+
+Group-based constraints (mutually-exclusive groups, minimum-behavioural pools) use an "add
+group" widget — pick 2+ variables and click Add; each group appears as its own removable row.
+
 ## Notes on package API surface
 
 Both packages' READMEs have occasionally been ahead of what's actually importable in a given
@@ -135,3 +153,16 @@ yet published to PyPI — install from source (`pip install -e path/to/SearchLib
 engine venv to use the "Bundled example dataset" option on that page; otherwise use "Upload CSV"
 / "Path on disk" instead until a release ships it. If you upgrade either package, re-check
 `app/lib/script_gen.py` against the new signatures before trusting generated scripts.
+
+**SearchLibrium `pre_spec_constraints` bug (fixed in source, not yet on PyPI):** while building
+the constraints dashboard we found `ConstraintBuilder`-based constraints (`force_include`,
+`mutually_exclusive`, `min_behavioral`, `force_random`, `never_random`) had **zero effect** on
+any search prior to this fix — `Search.apply_constraints()` and its helpers checked
+`self.pres_spec_constr`, an attribute that only ever exists on the `Parameters` object
+(`self.param.pres_spec_constr`), never on the solver itself, so `hasattr()` was always `False`
+and every constraint silently no-op'd. Also `apply_constraints()` was never called at all from
+the plain multinomial/mixed-logit/RRM evaluation path (only latent-class/nested/mixed-nested
+routed through it). Both are fixed in `search.py` in the local source checkout; verified with a
+real search where a `mutually_exclusive(['COST','HEADWAY'])` group is now actually enforced
+(previously both appeared together in the result regardless). Until a new PyPI release ships
+this, constraints only work with an editable/source install of SearchLibrium.

@@ -5,8 +5,14 @@ import streamlit as st
 
 from lib.env import DEFAULT_ENGINE_PYTHON
 from lib.pbs_gen import PbsConfig, generate_pbs_script
-from lib.script_gen import SearchLibriumConfig, generate_searchlibrium_script, SEARCHLIBRIUM_BUNDLED_PRESETS
-from lib.ui_common import render_run_and_export
+from lib.script_gen import (
+    SearchLibriumConfig,
+    SearchLibriumConstraintsConfig,
+    SEARCHLIBRIUM_BUNDLED_PRESETS,
+    SEARCHLIBRIUM_DISTRIBUTIONS,
+    generate_searchlibrium_script,
+)
+from lib.ui_common import render_exclusive_groups, render_pool_rules, render_run_and_export
 
 st.set_page_config(page_title="SearchLibrium — ModelZoo", page_icon="🔎", layout="wide")
 st.title("🔎 SearchLibrium runner")
@@ -95,7 +101,43 @@ asvarnames = st.multiselect(
 )
 isvarnames = st.multiselect("Individual-specific variables (optional)", [c for c in columns if c not in {choice_col, alt_col, choice_id_col, *asvarnames}])
 
-st.subheader("4. Model & search settings")
+all_candidate_vars = asvarnames + isvarnames
+
+st.subheader("4. Constraints")
+st.caption("Maps onto SearchLibrium's `ConstraintBuilder` — see the README's Constraints section for the full reference.")
+c1, c2 = st.columns(2)
+with c1:
+    sl_force_include = st.multiselect("Force include (must always appear)", all_candidate_vars)
+    sl_never_include = st.multiselect("Never include (must never appear)", all_candidate_vars)
+with c2:
+    sl_force_random_vars = st.multiselect("Force random (must have a random parameter)", all_candidate_vars)
+    sl_force_random_dist = st.selectbox(
+        "...with distribution", list(SEARCHLIBRIUM_DISTRIBUTIONS.keys()),
+        format_func=lambda k: f"{k} — {SEARCHLIBRIUM_DISTRIBUTIONS[k]}",
+        disabled=not sl_force_random_vars,
+    )
+    sl_exclude_random = st.multiselect("Exclude random (must never be random)", all_candidate_vars)
+
+st.markdown("**Mutually exclusive groups** — at most one variable per group may appear in any solution.")
+sl_mutex_groups = render_exclusive_groups(
+    "sl_mutex", all_candidate_vars,
+    help_text="e.g. alternative speed definitions — never both in the model.",
+)
+
+st.markdown("**Minimum behavioural content** — require at least N variables from a pool, without locking in which ones.")
+sl_pool_rules = render_pool_rules(
+    "sl_pool", all_candidate_vars,
+    help_text="e.g. at least 2 of {PRICE, BIKELANE, DIST6, RECRE} must be present.",
+)
+
+constraints_cfg = SearchLibriumConstraintsConfig(
+    force_include=sl_force_include, never_include=sl_never_include,
+    mutually_exclusive_groups=sl_mutex_groups, min_behavioral_rules=sl_pool_rules,
+    force_random_vars=sl_force_random_vars, force_random_distribution=sl_force_random_dist,
+    exclude_random=sl_exclude_random,
+)
+
+st.subheader("5. Model & search settings")
 c1, c2, c3 = st.columns(3)
 with c1:
     models = st.multiselect(
@@ -125,7 +167,7 @@ if "nested_logit" in models:
     nests_json = st.text_area("nests (JSON)", value='{"nest_1": [0, 1]}')
     lambdas_json = st.text_area("lambdas (JSON)", value='{"nest_1": 0.8}')
 
-st.subheader("5. Job naming & output")
+st.subheader("6. Job naming & output")
 c1, c2, c3 = st.columns(3)
 with c1:
     experiment_name = st.text_input("Experiment name", value="searchlibrium_run")
@@ -160,6 +202,7 @@ else:
         nests_json=nests_json, lambdas_json=lambdas_json,
         output_dir=output_dir, experiment_name=experiment_name,
         use_bundled=use_bundled,
+        constraints=constraints_cfg,
     )
 
     local_script = generate_searchlibrium_script(cfg, for_hpc=False)

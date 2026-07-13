@@ -5,8 +5,13 @@ import streamlit as st
 
 from lib.env import DEFAULT_ENGINE_PYTHON
 from lib.pbs_gen import PbsConfig, generate_pbs_script
-from lib.script_gen import ConstraintsConfig, MetaCountConfig, generate_metacount_script
-from lib.ui_common import render_run_and_export
+from lib.script_gen import (
+    ConstraintsConfig,
+    MetaCountConfig,
+    METACOUNT_DISTRIBUTIONS,
+    generate_metacount_script,
+)
+from lib.ui_common import render_exclusive_groups, render_run_and_export
 
 st.set_page_config(page_title="MetaCountRegressor — ModelZoo", page_icon="📈", layout="wide")
 st.title("📈 MetaCountRegressor runner")
@@ -78,14 +83,38 @@ variables = st.multiselect(
 )
 
 st.subheader("4. Constraints")
+st.caption("Maps directly onto metacountregressor's `ModelConstraints` — see `get_help('constraints')` in the package for the full reference.")
 c1, c2 = st.columns(2)
 with c1:
-    force_include = st.multiselect("Force include", variables)
+    force_include = st.multiselect("Force include (never excluded)", variables)
+    force_fixed = st.multiselect("Force fixed (excluded or fixed only, never random)", variables)
     no_random = st.multiselect("Never random", variables)
-with c2:
     no_zi = st.multiselect("Never zero-inflation term", variables)
-    exclude = st.multiselect("Exclude from search", variables)
-constraints_cfg = ConstraintsConfig(force_include=force_include, no_random=no_random, no_zi=no_zi, exclude=exclude)
+    exclude = st.multiselect("Exclude from search entirely", variables)
+with c2:
+    membership_only = st.multiselect("Membership only (class-membership eq., no outcome effect)", variables)
+    allow_membership = st.multiselect("Allow membership (may enter both membership + outcome)", variables)
+    outcome_only = st.multiselect("Outcome only (never drives class membership)", variables)
+    allow_random_vars = st.multiselect("Allow random with restricted distributions", variables)
+    allow_random_distributions = st.multiselect(
+        "...restricted to these distributions", METACOUNT_DISTRIBUTIONS,
+        default=METACOUNT_DISTRIBUTIONS, disabled=not allow_random_vars,
+    )
+
+st.markdown("**Mutually exclusive groups** — at most one variable per group may appear in the search (multicollinearity/redundancy guard).")
+mutual_exclusion_groups = render_exclusive_groups(
+    "mc_mutex", variables,
+    help_text="e.g. competing definitions of the same measure (SPEED vs SPEED_50).",
+)
+
+constraints_cfg = ConstraintsConfig(
+    force_include=force_include, force_fixed=force_fixed, no_random=no_random,
+    no_zi=no_zi, exclude=exclude, membership_only=membership_only,
+    allow_membership=allow_membership, outcome_only=outcome_only,
+    allow_random_vars=allow_random_vars,
+    allow_random_distributions=allow_random_distributions or list(METACOUNT_DISTRIBUTIONS),
+    mutual_exclusion_groups=mutual_exclusion_groups,
+)
 
 st.subheader("5. Model family & search structure")
 c1, c2, c3 = st.columns(3)
@@ -142,6 +171,18 @@ with c2:
     mem_gb = st.number_input("HPC mem (GB)", 4, 512, 32)
 with c3:
     walltime = st.text_input("HPC walltime", value="24:00:00")
+
+has_any_constraint = any([
+    force_include, force_fixed, no_random, no_zi, exclude, membership_only,
+    allow_membership, outcome_only, allow_random_vars, mutual_exclusion_groups,
+])
+if has_any_constraint and model_family != "count":
+    st.warning(
+        f"model_family={model_family!r}: metacountregressor's `build_evaluator()` only merges "
+        "`ModelConstraints` for the 'count' family (verified against source) — the constraints "
+        "above, including mutually-exclusive groups, will likely be silently ignored for this "
+        "search. Switch to 'count' if the constraints must be enforced."
+    )
 
 st.divider()
 
