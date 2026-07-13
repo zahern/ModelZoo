@@ -9,6 +9,8 @@ from lib.abm import (
     GA_BUDGETS,
     GA_ESTIMATORS,
     HHTS_SEARCH_PRESETS,
+    MCR_ALGOS,
+    MCR_FAMILIES,
     check_code_dir,
 )
 from lib.env import DEFAULT_ENGINE_PYTHON
@@ -47,11 +49,15 @@ mode = st.selectbox(
 )
 info = ABM_MODES[mode]
 st.info(info["help"])
+with st.expander("What does this run mode actually do?", expanded=True):
+    st.markdown(info["detail"])
 
 # ── 3. Strategy & options ────────────────────────────────────────────────────
 st.subheader("3. Strategy & options")
 
 zone = ""
+mcr_data_path = ""
+mcr_family, mcr_algo, mcr_max_iter, mcr_r = "count", "sa", 2000, 200
 search_preset = ""
 sa_iter = sa_temp = None
 sa_model = ""
@@ -59,13 +65,29 @@ ga_estimator, ga_budget = "default", "standard"
 ga_n_restarts = None
 ga_use_bandit_sa = False
 
-if info["takes_zone"]:
+if info["second_arg"] == "zone":
     zone = st.text_input(
         "Zone selector (optional)",
         value="",
         help="A zone number (e.g. 40), a comma-separated list (40,124,200), "
              "or a path to a zone file. Leave blank for the full region.",
     )
+elif info["second_arg"] == "data_path":
+    mcr_data_path = st.text_input(
+        "External dataset CSV (optional)",
+        value="",
+        help="Path to a CSV to search over. Leave blank to use the bundled Example 16-3 "
+             "crash-frequency dataset — this is NOT a zone selector, mcr_search doesn't touch "
+             "the ABM pipeline or synthetic population at all.",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        mcr_family = st.selectbox("Model family (MCR_FAMILY)", list(MCR_FAMILIES.keys()))
+        st.caption(MCR_FAMILIES[mcr_family])
+        mcr_algo = st.selectbox("Search algorithm (MCR_ALGO)", MCR_ALGOS)
+    with c2:
+        mcr_max_iter = st.number_input("Max iterations (MCR_MAX_ITER)", 50, 100000, 2000, step=50)
+        mcr_r = st.number_input("Halton draws (MCR_R)", 25, 2000, 200, step=25)
 
 if info["hhts"]:
     c1, c2 = st.columns(2)
@@ -123,11 +145,13 @@ with c3:
     walltime = st.text_input("Walltime", value="23:00:00")
 
 cfg = AbmRunConfig(
-    code_dir=code_dir, mode=mode, zone=zone,
+    code_dir=code_dir, mode=mode, zone=zone, mcr_data_path=mcr_data_path,
     search_preset=search_preset if info["hhts"] else "",
     sa_iter=sa_iter, sa_temp=sa_temp, sa_model=sa_model,
     ga_estimator=ga_estimator, ga_budget=ga_budget,
     ga_n_restarts=ga_n_restarts, ga_use_bandit_sa=ga_use_bandit_sa,
+    mcr_family=mcr_family, mcr_algo=mcr_algo,
+    mcr_max_iter=int(mcr_max_iter), mcr_r=int(mcr_r),
     run_tag=run_tag, accelerator=accelerator,
     threads=int(threads) or None,
     ncpus=int(ncpus), mem=mem, walltime=walltime,

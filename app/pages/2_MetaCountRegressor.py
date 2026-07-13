@@ -91,7 +91,17 @@ st.subheader("5. Model family & search structure")
 c1, c2, c3 = st.columns(3)
 with c1:
     model_family = st.selectbox("Model family", ["count", "duration", "linear"])
-    fit_model_family = st.selectbox("Family to fit best structure with", ["nb", "poisson", "lognormal", "gaussian"])
+    fit_family_options = {
+        "count": ["nb", "poisson"],
+        "duration": ["lognormal", "tobit"],
+        "linear": ["gaussian"],
+    }[model_family]
+    fit_model_families = st.multiselect(
+        "Refit best structure as (pick 2+ to compare, e.g. Poisson vs NB)",
+        fit_family_options, default=fit_family_options,
+        help="Each selected family is refit on the search's best structure and, if you pick "
+             "more than one, compared with metacountregressor's compare_models() (BIC/AIC/loglik).",
+    )
 with c2:
     role_labels = {
         0: "0 Excluded", 1: "1 Fixed", 2: "2 Random (ind.)", 3: "3 Random (corr.)",
@@ -149,7 +159,7 @@ else:
         model_family=model_family, default_roles=default_roles or [0, 1],
         max_latent_classes=int(max_latent_classes), r_draws=int(r_draws),
         algo=algo, max_iter=int(max_iter), seed=int(seed),
-        fit_model_family=fit_model_family, final_r_draws=int(final_r_draws),
+        fit_model_families=fit_model_families or [fit_family_options[0]], final_r_draws=int(final_r_draws),
         output_dir=output_dir, experiment_name=experiment_name,
         search_description=search_description,
     )

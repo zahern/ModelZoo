@@ -5,7 +5,7 @@ import streamlit as st
 
 from lib.env import DEFAULT_ENGINE_PYTHON
 from lib.pbs_gen import PbsConfig, generate_pbs_script
-from lib.script_gen import SearchLibriumConfig, generate_searchlibrium_script
+from lib.script_gen import SearchLibriumConfig, generate_searchlibrium_script, SEARCHLIBRIUM_BUNDLED_PRESETS
 from lib.ui_common import render_run_and_export
 
 st.set_page_config(page_title="SearchLibrium — ModelZoo", page_icon="🔎", layout="wide")
@@ -14,15 +14,32 @@ st.caption("Discrete-choice model structure search: Multinomial/Mixed/Nested Log
 
 engine_python = st.session_state.get("engine_python", DEFAULT_ENGINE_PYTHON)
 
+BUNDLED_LABELS = {
+    "swiss_metro": "swiss_metro — SP study, car/train/SM, 3 alts (README quick start)",
+    "electricity": "electricity — stated-preference electricity plan choice, 4 alts",
+    "travel_mode": "travel_mode — air/train/bus/car mode choice, 4 alts",
+}
+
 st.subheader("1. Data")
 st.caption("Long-format choice data — one row per alternative per observation.")
-data_choice = st.radio("Data source", ["Upload CSV", "Path on disk"], horizontal=True)
+data_choice = st.radio("Data source", ["Bundled example dataset", "Upload CSV", "Path on disk"], horizontal=True)
 
 df: pd.DataFrame | None = None
 data_path = ""
 uploaded_path: Path | None = None
+use_bundled: str | None = None
+preset: dict | None = None
 
-if data_choice == "Upload CSV":
+if data_choice == "Bundled example dataset":
+    bundled_label = st.selectbox("Dataset", list(BUNDLED_LABELS.values()))
+    use_bundled = next(k for k, v in BUNDLED_LABELS.items() if v == bundled_label)
+    preset = SEARCHLIBRIUM_BUNDLED_PRESETS[use_bundled]
+    st.info(
+        f"Shipped inside SearchLibrium (`{preset['loader']}()`) — no file to upload, and none "
+        f"needs to travel with an HPC job. Columns: {', '.join(preset['columns'])}"
+    )
+    columns = preset["columns"]
+elif data_choice == "Upload CSV":
     up = st.file_uploader("CSV file", type=["csv"])
     if up is not None:
         job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_uploads"
@@ -42,25 +59,40 @@ else:
 if df is not None:
     st.dataframe(df.head(20), use_container_width=True, height=200)
     columns = list(df.columns)
-else:
+elif use_bundled is None:
     columns = []
     st.info("Provide data to continue.")
 
 st.subheader("2. Column mapping")
-c1, c2, c3 = st.columns(3)
-with c1:
-    choice_col = st.selectbox("Choice column (0/1)", columns, index=columns.index("CHOICE") if "CHOICE" in columns else 0) if columns else st.text_input("Choice column", "CHOICE")
-    alt_col = st.selectbox("Alternative column", columns, index=columns.index("alt") if "alt" in columns else 0) if columns else st.text_input("Alternative column", "alt")
-with c2:
-    choice_id_col = st.selectbox("Observation/choice-set ID column", columns, index=columns.index("custom_id") if "custom_id" in columns else 0) if columns else st.text_input("Choice ID column", "custom_id")
-    ind_id_options = ["(none)"] + columns
-    ind_id_col = st.selectbox("Individual ID column (panel data)", ind_id_options)
-    ind_id_col = None if ind_id_col == "(none)" else ind_id_col
-with c3:
-    base_alt = st.text_input("Base alternative", value="")
+if preset is not None:
+    st.caption("Fixed by the bundled dataset's known schema (see the loader's docstring for details).")
+    choice_col, alt_col, choice_id_col = preset["choice_col"], preset["alt_col"], preset["choice_id_col"]
+    ind_id_col, base_alt = preset["ind_id_col"], preset["base_alt"]
+    st.code(
+        f"choice_col={choice_col!r}  alt_col={alt_col!r}  choice_id_col={choice_id_col!r}  "
+        f"ind_id_col={ind_id_col!r}  base_alt={base_alt!r}",
+        language="text",
+    )
+else:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        choice_col = st.selectbox("Choice column (0/1)", columns, index=columns.index("CHOICE") if "CHOICE" in columns else 0) if columns else st.text_input("Choice column", "CHOICE")
+        alt_col = st.selectbox("Alternative column", columns, index=columns.index("alt") if "alt" in columns else 0) if columns else st.text_input("Alternative column", "alt")
+    with c2:
+        choice_id_col = st.selectbox("Observation/choice-set ID column", columns, index=columns.index("custom_id") if "custom_id" in columns else 0) if columns else st.text_input("Choice ID column", "custom_id")
+        ind_id_options = ["(none)"] + columns
+        ind_id_col = st.selectbox("Individual ID column (panel data)", ind_id_options)
+        ind_id_col = None if ind_id_col == "(none)" else ind_id_col
+    with c3:
+        base_alt = st.text_input("Base alternative", value="")
 
 st.subheader("3. Candidate variables")
-asvarnames = st.multiselect("Alternative-specific variables (varnames)", [c for c in columns if c not in {choice_col, alt_col, choice_id_col}])
+default_asvars = preset["default_vars"] if preset is not None else []
+asvarnames = st.multiselect(
+    "Alternative-specific variables (varnames)",
+    [c for c in columns if c not in {choice_col, alt_col, choice_id_col}],
+    default=default_asvars,
+)
 isvarnames = st.multiselect("Individual-specific variables (optional)", [c for c in columns if c not in {choice_col, alt_col, choice_id_col, *asvarnames}])
 
 st.subheader("4. Model & search settings")
@@ -109,11 +141,12 @@ with c2:
 
 st.divider()
 
-ready = bool(models and (asvarnames or isvarnames) and df is not None)
+has_data = use_bundled is not None or df is not None
+ready = bool(models and (asvarnames or isvarnames) and has_data)
 if not ready:
     st.warning("Select data, at least one model type, and at least one variable to generate a script.")
 else:
-    hpc_data_filename = Path(data_path).name
+    hpc_data_filename = Path(data_path).name if data_path else ""
 
     cfg = SearchLibriumConfig(
         data_path=data_path,
@@ -126,6 +159,7 @@ else:
         criterion=criterion, algorithm=algorithm, seed=int(seed),
         nests_json=nests_json, lambdas_json=lambdas_json,
         output_dir=output_dir, experiment_name=experiment_name,
+        use_bundled=use_bundled,
     )
 
     local_script = generate_searchlibrium_script(cfg, for_hpc=False)
