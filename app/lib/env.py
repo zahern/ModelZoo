@@ -13,6 +13,27 @@ from pathlib import Path
 DEFAULT_ENGINE_PYTHON = r"Z:\test_runs_tours\code\.venv\Scripts\python.exe"
 DEFAULT_ABM_CODE_DIR = r"Z:\test_runs_tours\code"
 
+# Local dev checkouts, prefilled as a convenience for "install from local source" —
+# harmless if these paths don't exist on a given machine, just leaves the field blank-ish.
+KNOWN_SOURCE_PATHS: dict[str, str] = {
+    "SearchLibrium": r"C:\Users\ahernz\source\SearchLibrium",
+    "metacountregressor": r"C:\Users\ahernz\source\MetaCount",
+}
+
+UPDATABLE_PACKAGES: dict[str, list[str]] = {
+    "SearchLibrium": ["SearchLibrium"],
+    "metacountregressor": ["metacountregressor"],
+    "jax + jaxlib + jaxopt": ["jax", "jaxlib", "jaxopt"],
+}
+
+
+def build_pip_upgrade_cmd(python_exe: str, pip_names: list[str]) -> list[str]:
+    return [python_exe, "-m", "pip", "install", "--upgrade", *pip_names]
+
+
+def build_pip_editable_cmd(python_exe: str, source_path: str) -> list[str]:
+    return [python_exe, "-m", "pip", "install", "-e", source_path]
+
 _PROBE_SCRIPT = r"""
 import json, sys
 info = {"python_version": sys.version, "packages": {}}

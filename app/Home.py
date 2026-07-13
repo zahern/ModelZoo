@@ -1,6 +1,14 @@
 import streamlit as st
 
-from lib.env import DEFAULT_ENGINE_PYTHON, probe_engine
+from lib.env import (
+    DEFAULT_ENGINE_PYTHON,
+    KNOWN_SOURCE_PATHS,
+    UPDATABLE_PACKAGES,
+    build_pip_editable_cmd,
+    build_pip_upgrade_cmd,
+    probe_engine,
+)
+from lib.runner import stream_cmd
 
 st.set_page_config(page_title="ModelZoo", page_icon="🔬", layout="wide")
 
@@ -42,6 +50,53 @@ else:
                 st.metric(pkg, "missing", delta="FAIL", delta_color="inverse")
                 with st.expander("error"):
                     st.code(info.get("error", ""))
+
+st.divider()
+st.subheader("Update engine packages")
+st.caption("Runs pip inside the engine interpreter above. Re-run **Check engine** afterwards to confirm the new versions.")
+
+c1, c2 = st.columns(2)
+with c1:
+    update_targets = st.multiselect("Packages to update", list(UPDATABLE_PACKAGES.keys()))
+with c2:
+    update_method = st.radio(
+        "Update from",
+        ["PyPI (upgrade to latest release)", "Local source (editable install)"],
+        horizontal=True,
+    )
+
+source_paths: dict[str, str] = {}
+if update_method.startswith("Local"):
+    for pkg in update_targets:
+        if pkg not in KNOWN_SOURCE_PATHS:
+            st.caption(f"{pkg} has no local-source option — will upgrade from PyPI instead.")
+            continue
+        source_paths[pkg] = st.text_input(
+            f"{pkg} source path", value=KNOWN_SOURCE_PATHS.get(pkg, ""), key=f"src_path_{pkg}"
+        )
+
+if st.button("Run update", disabled=not update_targets, type="primary"):
+    console = st.empty()
+    lines: list[str] = []
+
+    def _log(line: str) -> None:
+        lines.append(line)
+        console.code("\n".join(lines[-500:]), language="text")
+
+    for pkg in update_targets:
+        if update_method.startswith("Local") and pkg in source_paths:
+            path = source_paths[pkg].strip()
+            if not path:
+                _log(f"[skip] {pkg}: no source path given")
+                continue
+            argv = build_pip_editable_cmd(engine_python, path)
+        else:
+            argv = build_pip_upgrade_cmd(engine_python, UPDATABLE_PACKAGES[pkg])
+        _log(f"\n$ {' '.join(argv)}")
+        with st.spinner(f"Updating {pkg}..."):
+            for line in stream_cmd(argv):
+                _log(line)
+    st.success("Update finished. Click **Check engine** above to refresh the version grid.")
 
 st.divider()
 st.markdown(

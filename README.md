@@ -56,12 +56,27 @@ Streamlit prints a local URL (defaults to `http://localhost:8501`) — open it i
 Running headless on a remote box (no browser to auto-open)? Add
 `--server.headless true --server.port 8501` to the command above.
 
+**Or just double-click `RunModelZoo.exe`** in the repo root — it starts Streamlit using the
+`.venv` next to it and opens the app in your default browser automatically. It's a thin
+launcher (~8 MB, doesn't bundle Streamlit/pandas itself), so `.venv` must already be set up
+per step 1 first. If you change `launcher.py`, rebuild it with:
+
+```powershell
+.venv\Scripts\python.exe build_exe.py
+```
+
 ### 3. Point it at your engine interpreter
 
 On the **Home** page, the sidebar has an "Engine Python interpreter" field, prefilled with the
 default engine venv path. Change it if yours lives elsewhere, then click **Check engine** — it
 imports SearchLibrium/metacountregressor/JAX in that interpreter (first check can take
 30-90s, mostly JAX) and shows a pass/fail grid per package.
+
+Below the status grid, **Update engine packages** runs `pip` inside that same interpreter — pick
+SearchLibrium / metacountregressor / the jax stack, either "PyPI (upgrade to latest release)" or
+"Local source (editable install)" (prefilled with this machine's dev checkouts under
+`C:\Users\ahernz\source\...`, override the path for a different setup), and **Run update** streams
+the pip output live. Re-run **Check engine** afterwards to confirm the new version landed.
 
 ### 4. Try a page
 
