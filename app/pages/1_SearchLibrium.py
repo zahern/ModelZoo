@@ -15,6 +15,8 @@ from lib.script_gen import (
     StandaloneFitConfig,
     STANDALONE_MODEL_FAMILIES,
     generate_standalone_fit_script,
+    MDCEVConfig,
+    generate_mdcev_script,
 )
 from lib.ui_common import render_exclusive_groups, render_pool_rules, render_run_and_export
 from lib.runner import stream_run
@@ -31,7 +33,7 @@ BUNDLED_LABELS = {
     "travel_mode": "travel_mode — air/train/bus/car mode choice, 4 alts",
 }
 
-tab_search, tab_standalone = st.tabs(["Structure search", "Standalone fit"])
+tab_search, tab_standalone, tab_mdcev = st.tabs(["Structure search", "Standalone fit", "MDCEV budget allocation"])
 
 with tab_search:
     st.subheader("1. Data")
@@ -530,4 +532,147 @@ with tab_standalone:
             pbs_script=sf_pbs_script, pbs_script_name=f"{sf_experiment_name}.pbs",
             engine_python=engine_python,
             data_file_to_bundle=sf_uploaded_path,
+        )
+
+with tab_mdcev:
+    st.caption(
+        "Translated-utility MDCEV allocator (`MDCEVModel`) for continuous budget splits — e.g. daily "
+        "time-use minutes or discretionary spend split across activities/categories. Data should have "
+        "one row per observation, with one column per alternative holding its allocated amount "
+        "(these should sum to each observation's total budget)."
+    )
+
+    st.subheader("1. Data")
+    md_data_choice = st.radio("Data source", ["Upload CSV", "Path on disk"], horizontal=True, key="md_data_choice")
+    md_df: pd.DataFrame | None = None
+    md_data_path = ""
+    md_uploaded_path: Path | None = None
+    if md_data_choice == "Upload CSV":
+        md_up = st.file_uploader("CSV file", type=["csv"], key="md_upload")
+        if md_up is not None:
+            md_job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_uploads"
+            md_job_dir.mkdir(parents=True, exist_ok=True)
+            md_uploaded_path = md_job_dir / md_up.name
+            md_uploaded_path.write_bytes(md_up.getvalue())
+            md_data_path = str(md_uploaded_path)
+            md_df = pd.read_csv(md_uploaded_path)
+            st.dataframe(md_df.head(20), use_container_width=True, height=200)
+        md_columns = list(md_df.columns) if md_df is not None else []
+    else:
+        md_data_path = st.text_input("CSV path (must be readable by the engine interpreter)", value="", key="md_path")
+        if md_data_path and Path(md_data_path).exists():
+            try:
+                md_df = pd.read_csv(md_data_path, nrows=5000)
+                st.dataframe(md_df.head(20), use_container_width=True, height=200)
+            except Exception as e:
+                st.warning(f"Could not preview file: {e}")
+        md_columns = list(md_df.columns) if md_df is not None else []
+
+    if not md_columns:
+        st.info("Provide data to continue.")
+
+    st.subheader("2. Allocation columns")
+    md_allocation_cols = st.multiselect(
+        "Columns to allocate the budget across (each row's total = its budget)",
+        md_columns, key="md_alloc_cols",
+    )
+    md_outside_good_opts = ["(none)"] + md_allocation_cols
+    md_outside_good_col = st.selectbox(
+        "Outside good / numeraire (optional — modeled with near-zero satiation)",
+        md_outside_good_opts, key="md_outside_good",
+    )
+    md_outside_good_col = None if md_outside_good_col == "(none)" else md_outside_good_col
+
+    with st.expander("Advanced model parameters"):
+        c1, c2 = st.columns(2)
+        with c1:
+            md_alpha_floor = st.number_input("Alpha floor", 0.0, 0.5, 0.05, step=0.01, key="md_alpha_floor")
+            md_alpha_cap = st.number_input("Alpha cap", 0.5, 0.999, 0.95, step=0.01, key="md_alpha_cap")
+        with c2:
+            md_gamma_floor = st.number_input("Gamma floor", 1e-6, 1.0, 1e-3, step=1e-3, format="%.6f", key="md_gamma_floor")
+            md_tol = st.number_input("Numerical tolerance", 1e-12, 1e-3, 1e-9, step=1e-9, format="%.1e", key="md_tol")
+
+    st.subheader("3. Fit mode")
+    md_fit_mode_label = st.radio(
+        "Fit mode",
+        ["Heuristic (fast, moment-based)", "MLE refinement (slower, JAX autodiff quasi-MLE)"],
+        key="md_fit_mode",
+    )
+    md_fit_mode = "heuristic" if md_fit_mode_label.startswith("Heuristic") else "mle"
+    md_mle_maxiter, md_mle_l2 = 400, 1e-4
+    if md_fit_mode == "mle":
+        c1, c2 = st.columns(2)
+        with c1:
+            md_mle_maxiter = st.number_input("Max iterations", 20, 5000, 400, step=20, key="md_mle_maxiter")
+        with c2:
+            md_mle_l2 = st.number_input("L2 penalty", 0.0, 1.0, 1e-4, step=1e-4, format="%.5f", key="md_mle_l2")
+
+    st.subheader("4. Prediction / simulation")
+    st.caption(
+        "Deterministic `predict()` can show corner solutions (100% to one alternative) when its "
+        "gamma is small relative to others — this is expected translated-utility MDCEV behavior, "
+        "not a bug. `simulate()` adds Gumbel utility shocks across draws for realistic diversified "
+        "predictions."
+    )
+    md_budgets_text = st.text_input("Budget levels to predict for (comma-separated)", value="100, 300, 500", key="md_budgets")
+    try:
+        md_predict_budgets = [float(x.strip()) for x in md_budgets_text.split(",") if x.strip()]
+    except ValueError:
+        md_predict_budgets = []
+        st.warning("Could not parse budget levels — use comma-separated numbers, e.g. `100, 300, 500`.")
+    md_run_simulation = st.checkbox("Also run stochastic simulation", key="md_run_sim")
+    md_n_draws, md_sim_seed = 100, 42
+    if md_run_simulation:
+        c1, c2 = st.columns(2)
+        with c1:
+            md_n_draws = st.number_input("Simulation draws", 10, 5000, 100, step=10, key="md_n_draws")
+        with c2:
+            md_sim_seed = st.number_input("Random seed", 0, 999999, 42, key="md_sim_seed")
+
+    st.subheader("5. Job naming & output")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        md_experiment_name = st.text_input("Experiment name", value="mdcev_run", key="md_exp_name")
+    with c2:
+        md_output_dir = st.text_input("Output directory", value="results", key="md_output_dir")
+    with c3:
+        md_ncpus = st.number_input("HPC ncpus", 1, 64, 2, key="md_ncpus")
+    c1, c2 = st.columns(2)
+    with c1:
+        md_mem_gb = st.number_input("HPC mem (GB)", 4, 512, 16, key="md_mem")
+    with c2:
+        md_walltime = st.text_input("HPC walltime", value="4:00:00", key="md_walltime")
+
+    st.divider()
+
+    md_ready = bool(md_df is not None and len(md_allocation_cols) >= 2 and md_predict_budgets)
+    if not md_ready:
+        st.warning("Select data, at least two allocation columns, and valid budget levels to generate a script.")
+    else:
+        md_hpc_data_filename = Path(md_data_path).name if md_data_path else "data.csv"
+        md_cfg = MDCEVConfig(
+            data_path=md_data_path, hpc_data_filename=md_hpc_data_filename,
+            allocation_cols=md_allocation_cols, outside_good_col=md_outside_good_col,
+            alpha_floor=float(md_alpha_floor), alpha_cap=float(md_alpha_cap),
+            gamma_floor=float(md_gamma_floor), tol=float(md_tol),
+            fit_mode=md_fit_mode, mle_maxiter=int(md_mle_maxiter), mle_l2_penalty=float(md_mle_l2),
+            predict_budgets=md_predict_budgets,
+            run_simulation=bool(md_run_simulation), n_draws=int(md_n_draws), sim_seed=int(md_sim_seed),
+            output_dir=md_output_dir, experiment_name=md_experiment_name,
+        )
+
+        md_local_script = generate_mdcev_script(md_cfg, for_hpc=False)
+        md_hpc_script = generate_mdcev_script(md_cfg, for_hpc=True)
+        md_pbs_script = generate_pbs_script(PbsConfig(
+            job_name=md_experiment_name, script_filename="run_mdcev.py",
+            ncpus=int(md_ncpus), mem_gb=int(md_mem_gb), walltime=md_walltime,
+        ))
+
+        render_run_and_export(
+            key_prefix="mdcev",
+            local_script=md_local_script, local_script_name="run_mdcev.py",
+            hpc_script=md_hpc_script, hpc_script_name="run_mdcev.py",
+            pbs_script=md_pbs_script, pbs_script_name=f"{md_experiment_name}.pbs",
+            engine_python=engine_python,
+            data_file_to_bundle=md_uploaded_path,
         )
