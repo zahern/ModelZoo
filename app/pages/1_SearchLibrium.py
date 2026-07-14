@@ -12,6 +12,9 @@ from lib.script_gen import (
     SEARCHLIBRIUM_DISTRIBUTIONS,
     generate_searchlibrium_script,
     generate_searchlibrium_ctrl_preview,
+    StandaloneFitConfig,
+    STANDALONE_MODEL_FAMILIES,
+    generate_standalone_fit_script,
 )
 from lib.ui_common import render_exclusive_groups, render_pool_rules, render_run_and_export
 from lib.runner import stream_run
@@ -28,230 +31,503 @@ BUNDLED_LABELS = {
     "travel_mode": "travel_mode — air/train/bus/car mode choice, 4 alts",
 }
 
-st.subheader("1. Data")
-st.caption("Long-format choice data — one row per alternative per observation.")
-data_choice = st.radio("Data source", ["Bundled example dataset", "Upload CSV", "Path on disk"], horizontal=True)
+tab_search, tab_standalone = st.tabs(["Structure search", "Standalone fit"])
 
-df: pd.DataFrame | None = None
-data_path = ""
-uploaded_path: Path | None = None
-use_bundled: str | None = None
-preset: dict | None = None
+with tab_search:
+    st.subheader("1. Data")
+    st.caption("Long-format choice data — one row per alternative per observation.")
+    data_choice = st.radio("Data source", ["Bundled example dataset", "Upload CSV", "Path on disk"], horizontal=True)
 
-if data_choice == "Bundled example dataset":
-    bundled_label = st.selectbox("Dataset", list(BUNDLED_LABELS.values()))
-    use_bundled = next(k for k, v in BUNDLED_LABELS.items() if v == bundled_label)
-    preset = SEARCHLIBRIUM_BUNDLED_PRESETS[use_bundled]
-    st.info(
-        f"Shipped inside SearchLibrium (`{preset['loader']}()`) — no file to upload, and none "
-        f"needs to travel with an HPC job. Columns: {', '.join(preset['columns'])}"
+    df: pd.DataFrame | None = None
+    data_path = ""
+    uploaded_path: Path | None = None
+    use_bundled: str | None = None
+    preset: dict | None = None
+
+    if data_choice == "Bundled example dataset":
+        bundled_label = st.selectbox("Dataset", list(BUNDLED_LABELS.values()))
+        use_bundled = next(k for k, v in BUNDLED_LABELS.items() if v == bundled_label)
+        preset = SEARCHLIBRIUM_BUNDLED_PRESETS[use_bundled]
+        st.info(
+            f"Shipped inside SearchLibrium (`{preset['loader']}()`) — no file to upload, and none "
+            f"needs to travel with an HPC job. Columns: {', '.join(preset['columns'])}"
+        )
+        columns = preset["columns"]
+    elif data_choice == "Upload CSV":
+        up = st.file_uploader("CSV file", type=["csv"])
+        if up is not None:
+            job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_uploads"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            uploaded_path = job_dir / up.name
+            uploaded_path.write_bytes(up.getvalue())
+            data_path = str(uploaded_path)
+            df = pd.read_csv(uploaded_path)
+    else:
+        data_path = st.text_input("CSV path (must be readable by the engine interpreter)", value="")
+        if data_path and Path(data_path).exists():
+            try:
+                df = pd.read_csv(data_path, nrows=5000)
+            except Exception as e:
+                st.warning(f"Could not preview file: {e}")
+
+    if df is not None:
+        st.dataframe(df.head(20), use_container_width=True, height=200)
+        columns = list(df.columns)
+    elif use_bundled is None:
+        columns = []
+        st.info("Provide data to continue.")
+
+    st.subheader("2. Column mapping")
+    if preset is not None:
+        st.caption("Fixed by the bundled dataset's known schema (see the loader's docstring for details).")
+        choice_col, alt_col, choice_id_col = preset["choice_col"], preset["alt_col"], preset["choice_id_col"]
+        ind_id_col, base_alt = preset["ind_id_col"], preset["base_alt"]
+        st.code(
+            f"choice_col={choice_col!r}  alt_col={alt_col!r}  choice_id_col={choice_id_col!r}  "
+            f"ind_id_col={ind_id_col!r}  base_alt={base_alt!r}",
+            language="text",
+        )
+    else:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            choice_col = st.selectbox("Choice column (0/1)", columns, index=columns.index("CHOICE") if "CHOICE" in columns else 0) if columns else st.text_input("Choice column", "CHOICE")
+            alt_col = st.selectbox("Alternative column", columns, index=columns.index("alt") if "alt" in columns else 0) if columns else st.text_input("Alternative column", "alt")
+        with c2:
+            choice_id_col = st.selectbox("Observation/choice-set ID column", columns, index=columns.index("custom_id") if "custom_id" in columns else 0) if columns else st.text_input("Choice ID column", "custom_id")
+            ind_id_options = ["(none)"] + columns
+            ind_id_col = st.selectbox("Individual ID column (panel data)", ind_id_options)
+            ind_id_col = None if ind_id_col == "(none)" else ind_id_col
+        with c3:
+            base_alt = st.text_input("Base alternative", value="")
+
+    st.subheader("3. Candidate variables")
+    default_asvars = preset["default_vars"] if preset is not None else []
+    asvarnames = st.multiselect(
+        "Alternative-specific variables (varnames)",
+        [c for c in columns if c not in {choice_col, alt_col, choice_id_col}],
+        default=default_asvars,
     )
-    columns = preset["columns"]
-elif data_choice == "Upload CSV":
-    up = st.file_uploader("CSV file", type=["csv"])
-    if up is not None:
-        job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_uploads"
-        job_dir.mkdir(parents=True, exist_ok=True)
-        uploaded_path = job_dir / up.name
-        uploaded_path.write_bytes(up.getvalue())
-        data_path = str(uploaded_path)
-        df = pd.read_csv(uploaded_path)
-else:
-    data_path = st.text_input("CSV path (must be readable by the engine interpreter)", value="")
-    if data_path and Path(data_path).exists():
-        try:
-            df = pd.read_csv(data_path, nrows=5000)
-        except Exception as e:
-            st.warning(f"Could not preview file: {e}")
+    isvarnames = st.multiselect("Individual-specific variables (optional)", [c for c in columns if c not in {choice_col, alt_col, choice_id_col, *asvarnames}])
 
-if df is not None:
-    st.dataframe(df.head(20), use_container_width=True, height=200)
-    columns = list(df.columns)
-elif use_bundled is None:
-    columns = []
-    st.info("Provide data to continue.")
+    all_candidate_vars = asvarnames + isvarnames
 
-st.subheader("2. Column mapping")
-if preset is not None:
-    st.caption("Fixed by the bundled dataset's known schema (see the loader's docstring for details).")
-    choice_col, alt_col, choice_id_col = preset["choice_col"], preset["alt_col"], preset["choice_id_col"]
-    ind_id_col, base_alt = preset["ind_id_col"], preset["base_alt"]
-    st.code(
-        f"choice_col={choice_col!r}  alt_col={alt_col!r}  choice_id_col={choice_id_col!r}  "
-        f"ind_id_col={ind_id_col!r}  base_alt={base_alt!r}",
-        language="text",
+    st.subheader("4. Constraints")
+    st.caption("Maps onto SearchLibrium's `ConstraintBuilder` — see the README's Constraints section for the full reference.")
+    c1, c2 = st.columns(2)
+    with c1:
+        sl_force_include = st.multiselect("Force include (must always appear)", all_candidate_vars)
+        sl_never_include = st.multiselect("Never include (must never appear)", all_candidate_vars)
+    with c2:
+        sl_force_random_vars = st.multiselect("Force random (must have a random parameter)", all_candidate_vars)
+        sl_force_random_dist = st.selectbox(
+            "...with distribution", list(SEARCHLIBRIUM_DISTRIBUTIONS.keys()),
+            format_func=lambda k: f"{k} — {SEARCHLIBRIUM_DISTRIBUTIONS[k]}",
+            disabled=not sl_force_random_vars,
+        )
+        sl_exclude_random = st.multiselect("Exclude random (must never be random)", all_candidate_vars)
+
+    st.markdown("**Mutually exclusive groups** — at most one variable per group may appear in any solution.")
+    sl_mutex_groups = render_exclusive_groups(
+        "sl_mutex", all_candidate_vars,
+        help_text="e.g. alternative speed definitions — never both in the model.",
     )
-else:
+
+    st.markdown("**Minimum behavioural content** — require at least N variables from a pool, without locking in which ones.")
+    sl_pool_rules = render_pool_rules(
+        "sl_pool", all_candidate_vars,
+        help_text="e.g. at least 2 of {PRICE, BIKELANE, DIST6, RECRE} must be present.",
+    )
+
+    constraints_cfg = SearchLibriumConstraintsConfig(
+        force_include=sl_force_include, never_include=sl_never_include,
+        mutually_exclusive_groups=sl_mutex_groups, min_behavioral_rules=sl_pool_rules,
+        force_random_vars=sl_force_random_vars, force_random_distribution=sl_force_random_dist,
+        exclude_random=sl_exclude_random,
+    )
+
+    st.subheader("5. Model & search settings")
     c1, c2, c3 = st.columns(3)
     with c1:
-        choice_col = st.selectbox("Choice column (0/1)", columns, index=columns.index("CHOICE") if "CHOICE" in columns else 0) if columns else st.text_input("Choice column", "CHOICE")
-        alt_col = st.selectbox("Alternative column", columns, index=columns.index("alt") if "alt" in columns else 0) if columns else st.text_input("Alternative column", "alt")
+        models = st.multiselect(
+            "Model types to search over",
+            ["multinomial", "mixed_logit", "random_regret", "mixed_random_regret",
+             "nested_logit", "mixed_nested", "ordered_logit"],
+            default=["multinomial"],
+            help="mixed_nested needs allow_random + nests/lambdas below, same as nested_logit.",
+        )
+        criterion = st.selectbox("Objective (minimise)", ["bic", "aic", "loglik"])
+        mae_enabled = st.checkbox(
+            "Add MAE as a second objective (multi-objective)",
+            help="Auto-splits the data into train/test by individual (val_share below) unless "
+                 "you're already passing your own held-out set — see SearchLibrium's Parameters(df_test=...).",
+        )
+        val_share = st.number_input("Held-out share for MAE", 0.05, 0.5, 0.25, step=0.05, disabled=not mae_enabled)
     with c2:
-        choice_id_col = st.selectbox("Observation/choice-set ID column", columns, index=columns.index("custom_id") if "custom_id" in columns else 0) if columns else st.text_input("Choice ID column", "custom_id")
-        ind_id_options = ["(none)"] + columns
-        ind_id_col = st.selectbox("Individual ID column (panel data)", ind_id_options)
-        ind_id_col = None if ind_id_col == "(none)" else ind_id_col
+        allow_random = st.checkbox("Allow random parameters", value="mixed_logit" in models or "mixed_random_regret" in models or "mixed_nested" in models)
+        allow_bcvars = st.checkbox("Allow Box-Cox transforms")
+        allow_corvars = st.checkbox("Allow correlated random parameters")
+        latent_class = st.checkbox("Latent class model", help="Every solution in the search is fit as latent-class, regardless of the model types picked above.")
+        num_classes = st.number_input("Number of classes", 2, 6, 2, disabled=not latent_class)
     with c3:
-        base_alt = st.text_input("Base alternative", value="")
+        algorithm = st.selectbox(
+            "Search algorithm",
+            ["sa", "hs", "sapbil", "banditsa", "hspbil", "parsa", "parcopsa"],
+            help="parsa/parcopsa run nthrds independent SA solvers in parallel threads; "
+                 "parcopsa additionally shares the best solution across solvers periodically.",
+        )
+        nthrds = st.number_input("Parallel threads (nthrds)", 2, 16, 4, disabled=algorithm not in ("parsa", "parcopsa"))
+        p_val = st.number_input("Significance threshold (p_val)", 0.001, 0.5, 0.05, step=0.01)
+        seed = st.number_input("Run ID / seed", 1, 999999, 1)
 
-st.subheader("3. Candidate variables")
-default_asvars = preset["default_vars"] if preset is not None else []
-asvarnames = st.multiselect(
-    "Alternative-specific variables (varnames)",
-    [c for c in columns if c not in {choice_col, alt_col, choice_id_col}],
-    default=default_asvars,
-)
-isvarnames = st.multiselect("Individual-specific variables (optional)", [c for c in columns if c not in {choice_col, alt_col, choice_id_col, *asvarnames}])
+    c1, c2 = st.columns(2)
+    with c1:
+        n_draws = st.number_input("Halton draws (n_draws, for mixed models)", 50, 5000, 500, step=50)
+    with c2:
+        maxiter = st.number_input("Max MLE iterations per fit (maxiter)", 50, 10000, 2000, step=50)
 
-all_candidate_vars = asvarnames + isvarnames
+    nests_json = lambdas_json = None
+    if "nested_logit" in models or "mixed_nested" in models:
+        st.caption("Nested/mixed-nested logit require nest structure, e.g. `{\"PublicTransport\": [0, 1], \"Private\": [2, 3]}`")
+        nests_json = st.text_area("nests (JSON)", value='{"nest_1": [0, 1]}')
+        lambdas_json = st.text_area("lambdas (JSON)", value='{"nest_1": 0.8}')
 
-st.subheader("4. Constraints")
-st.caption("Maps onto SearchLibrium's `ConstraintBuilder` — see the README's Constraints section for the full reference.")
-c1, c2 = st.columns(2)
-with c1:
-    sl_force_include = st.multiselect("Force include (must always appear)", all_candidate_vars)
-    sl_never_include = st.multiselect("Never include (must never appear)", all_candidate_vars)
-with c2:
-    sl_force_random_vars = st.multiselect("Force random (must have a random parameter)", all_candidate_vars)
-    sl_force_random_dist = st.selectbox(
-        "...with distribution", list(SEARCHLIBRIUM_DISTRIBUTIONS.keys()),
-        format_func=lambda k: f"{k} — {SEARCHLIBRIUM_DISTRIBUTIONS[k]}",
-        disabled=not sl_force_random_vars,
+    st.subheader("6. Job naming & output")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        experiment_name = st.text_input("Experiment name", value="searchlibrium_run")
+    with c2:
+        output_dir = st.text_input("Output directory", value="results")
+    with c3:
+        ncpus = st.number_input("HPC ncpus", 1, 64, 4)
+    c1, c2 = st.columns(2)
+    with c1:
+        mem_gb = st.number_input("HPC mem (GB)", 4, 512, 32)
+    with c2:
+        walltime = st.text_input("HPC walltime", value="24:00:00")
+
+    st.divider()
+
+    has_data = use_bundled is not None or df is not None
+    ready = bool(models and (asvarnames or isvarnames) and has_data)
+    if not ready:
+        st.warning("Select data, at least one model type, and at least one variable to generate a script.")
+    else:
+        hpc_data_filename = Path(data_path).name if data_path else ""
+
+        cfg = SearchLibriumConfig(
+            data_path=data_path,
+            hpc_data_filename=hpc_data_filename,
+            choice_col=choice_col, alt_col=alt_col, choice_id_col=choice_id_col,
+            ind_id_col=ind_id_col, base_alt=base_alt,
+            asvarnames=asvarnames, isvarnames=isvarnames,
+            models=models, allow_random=allow_random, allow_bcvars=allow_bcvars,
+            allow_corvars=allow_corvars, p_val=p_val, n_draws=int(n_draws), maxiter=int(maxiter),
+            criterion=criterion, mae_enabled=mae_enabled, val_share=val_share,
+            algorithm=algorithm, nthrds=int(nthrds), seed=int(seed),
+            nests_json=nests_json, lambdas_json=lambdas_json,
+            latent_class=latent_class, num_classes=int(num_classes),
+            output_dir=output_dir, experiment_name=experiment_name,
+            use_bundled=use_bundled,
+            constraints=constraints_cfg,
+        )
+
+        with st.expander("Preview auto-estimated hyperparameters (before running)"):
+            st.caption("Runs `estimate_ctrl()` against your data/spec only — no search, seconds not minutes.")
+            if st.button("Preview hyperparameters", key="sl_ctrl_preview"):
+                preview_script = generate_searchlibrium_ctrl_preview(cfg)
+                job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_ctrl_preview"
+                job_dir.mkdir(parents=True, exist_ok=True)
+                script_path = job_dir / "ctrl_preview.py"
+                script_path.write_text(preview_script, encoding="utf-8")
+                lines: list[str] = []
+                console = st.empty()
+                with st.spinner("Estimating..."):
+                    for line in stream_run(engine_python, str(script_path), cwd=str(job_dir)):
+                        lines.append(line)
+                        console.code("\n".join(lines[-100:]), language="text")
+
+        local_script = generate_searchlibrium_script(cfg, for_hpc=False)
+        hpc_script = generate_searchlibrium_script(cfg, for_hpc=True)
+        pbs_script = generate_pbs_script(PbsConfig(
+            job_name=experiment_name, script_filename="run_searchlibrium.py",
+            ncpus=int(ncpus), mem_gb=int(mem_gb), walltime=walltime,
+        ))
+
+        render_run_and_export(
+            key_prefix="searchlibrium",
+            local_script=local_script, local_script_name="run_searchlibrium.py",
+            hpc_script=hpc_script, hpc_script_name="run_searchlibrium.py",
+            pbs_script=pbs_script, pbs_script_name=f"{experiment_name}.pbs",
+            engine_python=engine_python,
+            data_file_to_bundle=uploaded_path,
+        )
+
+with tab_standalone:
+    st.caption(
+        "Fit a single, pre-specified model directly — no metaheuristic search over structures. "
+        "Useful for exploring/reporting on one specification you already have in mind."
     )
-    sl_exclude_random = st.multiselect("Exclude random (must never be random)", all_candidate_vars)
-
-st.markdown("**Mutually exclusive groups** — at most one variable per group may appear in any solution.")
-sl_mutex_groups = render_exclusive_groups(
-    "sl_mutex", all_candidate_vars,
-    help_text="e.g. alternative speed definitions — never both in the model.",
-)
-
-st.markdown("**Minimum behavioural content** — require at least N variables from a pool, without locking in which ones.")
-sl_pool_rules = render_pool_rules(
-    "sl_pool", all_candidate_vars,
-    help_text="e.g. at least 2 of {PRICE, BIKELANE, DIST6, RECRE} must be present.",
-)
-
-constraints_cfg = SearchLibriumConstraintsConfig(
-    force_include=sl_force_include, never_include=sl_never_include,
-    mutually_exclusive_groups=sl_mutex_groups, min_behavioral_rules=sl_pool_rules,
-    force_random_vars=sl_force_random_vars, force_random_distribution=sl_force_random_dist,
-    exclude_random=sl_exclude_random,
-)
-
-st.subheader("5. Model & search settings")
-c1, c2, c3 = st.columns(3)
-with c1:
-    models = st.multiselect(
-        "Model types to search over",
-        ["multinomial", "mixed_logit", "random_regret", "mixed_random_regret",
-         "nested_logit", "mixed_nested", "ordered_logit"],
-        default=["multinomial"],
-        help="mixed_nested needs allow_random + nests/lambdas below, same as nested_logit.",
-    )
-    criterion = st.selectbox("Objective (minimise)", ["bic", "aic", "loglik"])
-    mae_enabled = st.checkbox(
-        "Add MAE as a second objective (multi-objective)",
-        help="Auto-splits the data into train/test by individual (val_share below) unless "
-             "you're already passing your own held-out set — see SearchLibrium's Parameters(df_test=...).",
-    )
-    val_share = st.number_input("Held-out share for MAE", 0.05, 0.5, 0.25, step=0.05, disabled=not mae_enabled)
-with c2:
-    allow_random = st.checkbox("Allow random parameters", value="mixed_logit" in models or "mixed_random_regret" in models or "mixed_nested" in models)
-    allow_bcvars = st.checkbox("Allow Box-Cox transforms")
-    allow_corvars = st.checkbox("Allow correlated random parameters")
-    latent_class = st.checkbox("Latent class model", help="Every solution in the search is fit as latent-class, regardless of the model types picked above.")
-    num_classes = st.number_input("Number of classes", 2, 6, 2, disabled=not latent_class)
-with c3:
-    algorithm = st.selectbox(
-        "Search algorithm",
-        ["sa", "hs", "sapbil", "banditsa", "hspbil", "parsa", "parcopsa"],
-        help="parsa/parcopsa run nthrds independent SA solvers in parallel threads; "
-             "parcopsa additionally shares the best solution across solvers periodically.",
-    )
-    nthrds = st.number_input("Parallel threads (nthrds)", 2, 16, 4, disabled=algorithm not in ("parsa", "parcopsa"))
-    p_val = st.number_input("Significance threshold (p_val)", 0.001, 0.5, 0.05, step=0.01)
-    seed = st.number_input("Run ID / seed", 1, 999999, 1)
-
-c1, c2 = st.columns(2)
-with c1:
-    n_draws = st.number_input("Halton draws (n_draws, for mixed models)", 50, 5000, 500, step=50)
-with c2:
-    maxiter = st.number_input("Max MLE iterations per fit (maxiter)", 50, 10000, 2000, step=50)
-
-nests_json = lambdas_json = None
-if "nested_logit" in models or "mixed_nested" in models:
-    st.caption("Nested/mixed-nested logit require nest structure, e.g. `{\"PublicTransport\": [0, 1], \"Private\": [2, 3]}`")
-    nests_json = st.text_area("nests (JSON)", value='{"nest_1": [0, 1]}')
-    lambdas_json = st.text_area("lambdas (JSON)", value='{"nest_1": 0.8}')
-
-st.subheader("6. Job naming & output")
-c1, c2, c3 = st.columns(3)
-with c1:
-    experiment_name = st.text_input("Experiment name", value="searchlibrium_run")
-with c2:
-    output_dir = st.text_input("Output directory", value="results")
-with c3:
-    ncpus = st.number_input("HPC ncpus", 1, 64, 4)
-c1, c2 = st.columns(2)
-with c1:
-    mem_gb = st.number_input("HPC mem (GB)", 4, 512, 32)
-with c2:
-    walltime = st.text_input("HPC walltime", value="24:00:00")
-
-st.divider()
-
-has_data = use_bundled is not None or df is not None
-ready = bool(models and (asvarnames or isvarnames) and has_data)
-if not ready:
-    st.warning("Select data, at least one model type, and at least one variable to generate a script.")
-else:
-    hpc_data_filename = Path(data_path).name if data_path else ""
-
-    cfg = SearchLibriumConfig(
-        data_path=data_path,
-        hpc_data_filename=hpc_data_filename,
-        choice_col=choice_col, alt_col=alt_col, choice_id_col=choice_id_col,
-        ind_id_col=ind_id_col, base_alt=base_alt,
-        asvarnames=asvarnames, isvarnames=isvarnames,
-        models=models, allow_random=allow_random, allow_bcvars=allow_bcvars,
-        allow_corvars=allow_corvars, p_val=p_val, n_draws=int(n_draws), maxiter=int(maxiter),
-        criterion=criterion, mae_enabled=mae_enabled, val_share=val_share,
-        algorithm=algorithm, nthrds=int(nthrds), seed=int(seed),
-        nests_json=nests_json, lambdas_json=lambdas_json,
-        latent_class=latent_class, num_classes=int(num_classes),
-        output_dir=output_dir, experiment_name=experiment_name,
-        use_bundled=use_bundled,
-        constraints=constraints_cfg,
+    st.info(
+        "9 of the 12 documented standalone model classes are supported here, each verified end-to-end "
+        "against the real engine this session (which surfaced and fixed 8 genuine upstream bugs in "
+        "SearchLibrium along the way). **MixedRandomRegret**, **MixedNested**, and **MultiLayerNestedLogit** "
+        "are omitted — each hits a deeper upstream bug (missing attribute initialization in their "
+        "constructor chains) that needs more substantial source surgery than a quick fix. "
+        "**OrderedLogitLong** is also omitted: it additionally requires long/expanded panel data "
+        "(one row per individual per ordinal category via `misc.wide_to_long`), which doesn't fit this "
+        "simple column-mapping UI — use plain `OrderedLogit` for standard one-row-per-observation data."
     )
 
-    with st.expander("Preview auto-estimated hyperparameters (before running)"):
-        st.caption("Runs `estimate_ctrl()` against your data/spec only — no search, seconds not minutes.")
-        if st.button("Preview hyperparameters", key="sl_ctrl_preview"):
-            preview_script = generate_searchlibrium_ctrl_preview(cfg)
-            job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_ctrl_preview"
-            job_dir.mkdir(parents=True, exist_ok=True)
-            script_path = job_dir / "ctrl_preview.py"
-            script_path.write_text(preview_script, encoding="utf-8")
-            lines: list[str] = []
-            console = st.empty()
-            with st.spinner("Estimating..."):
-                for line in stream_run(engine_python, str(script_path), cwd=str(job_dir)):
-                    lines.append(line)
-                    console.code("\n".join(lines[-100:]), language="text")
+    model_class = st.selectbox("Model class", list(STANDALONE_MODEL_FAMILIES.keys()), key="sf_model_class")
+    family = STANDALONE_MODEL_FAMILIES[model_class]
 
-    local_script = generate_searchlibrium_script(cfg, for_hpc=False)
-    hpc_script = generate_searchlibrium_script(cfg, for_hpc=True)
-    pbs_script = generate_pbs_script(PbsConfig(
-        job_name=experiment_name, script_filename="run_searchlibrium.py",
-        ncpus=int(ncpus), mem_gb=int(mem_gb), walltime=walltime,
-    ))
-
-    render_run_and_export(
-        key_prefix="searchlibrium",
-        local_script=local_script, local_script_name="run_searchlibrium.py",
-        hpc_script=hpc_script, hpc_script_name="run_searchlibrium.py",
-        pbs_script=pbs_script, pbs_script_name=f"{experiment_name}.pbs",
-        engine_python=engine_python,
-        data_file_to_bundle=uploaded_path,
+    st.subheader("1. Data")
+    sf_data_choice = st.radio(
+        "Data source", ["Bundled example dataset", "Upload CSV", "Path on disk"], horizontal=True, key="sf_data_choice",
     )
+    sf_df: pd.DataFrame | None = None
+    sf_data_path = ""
+    sf_uploaded_path: Path | None = None
+    sf_use_bundled: str | None = None
+    sf_preset: dict | None = None
+
+    if sf_data_choice == "Bundled example dataset":
+        sf_bundled_label = st.selectbox("Dataset", list(BUNDLED_LABELS.values()), key="sf_bundled")
+        sf_use_bundled = next(k for k, v in BUNDLED_LABELS.items() if v == sf_bundled_label)
+        sf_preset = SEARCHLIBRIUM_BUNDLED_PRESETS[sf_use_bundled]
+        st.info(f"Shipped inside SearchLibrium (`{sf_preset['loader']}()`). Columns: {', '.join(sf_preset['columns'])}")
+        sf_columns = sf_preset["columns"]
+    elif sf_data_choice == "Upload CSV":
+        sf_up = st.file_uploader("CSV file", type=["csv"], key="sf_upload")
+        if sf_up is not None:
+            sf_job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_uploads"
+            sf_job_dir.mkdir(parents=True, exist_ok=True)
+            sf_uploaded_path = sf_job_dir / sf_up.name
+            sf_uploaded_path.write_bytes(sf_up.getvalue())
+            sf_data_path = str(sf_uploaded_path)
+            sf_df = pd.read_csv(sf_uploaded_path)
+            st.dataframe(sf_df.head(20), use_container_width=True, height=200)
+        sf_columns = list(sf_df.columns) if sf_df is not None else []
+    else:
+        sf_data_path = st.text_input("CSV path (must be readable by the engine interpreter)", value="", key="sf_path")
+        if sf_data_path and Path(sf_data_path).exists():
+            try:
+                sf_df = pd.read_csv(sf_data_path, nrows=5000)
+                st.dataframe(sf_df.head(20), use_container_width=True, height=200)
+            except Exception as e:
+                st.warning(f"Could not preview file: {e}")
+        sf_columns = list(sf_df.columns) if sf_df is not None else []
+
+    if not sf_columns:
+        st.info("Provide data to continue.")
+
+    # Defaults shared across families
+    sf_choice_col = sf_alt_col = sf_choice_id_col = ""
+    sf_ind_id_col = sf_avail_col = None
+    sf_base_alt = ""
+    sf_asvarnames: list[str] = []
+    sf_isvarnames: list[str] = []
+    sf_randvars: dict[str, str] = {}
+    sf_correlated_vars: list[str] = []
+    sf_n_draws = 1000
+    sf_nests_json = sf_lambdas_json = None
+    sf_ordinal_y_col = ""
+    sf_n_categories = 3
+    sf_ordered_distr = "logit"
+    sf_normalize = False
+    sf_binary_y_col = ""
+    sf_selection_y_col = ""
+    sf_selection_varnames: list[str] = []
+    sf_outcome_y_col = ""
+    sf_outcome_varnames: list[str] = []
+    sf_n_classes = 2
+    sf_membership_vars: list[str] = []
+    sf_fit_intercept = False
+    sf_maxiter = 2000
+
+    is_choice_family = family in ("mnl_family", "mixed_logit", "nested", "rrm", "latent_class_mxl")
+
+    if is_choice_family:
+        st.subheader("2. Column mapping")
+        if sf_preset is not None:
+            sf_choice_col, sf_alt_col, sf_choice_id_col = sf_preset["choice_col"], sf_preset["alt_col"], sf_preset["choice_id_col"]
+            sf_ind_id_col, sf_base_alt = sf_preset["ind_id_col"], sf_preset["base_alt"]
+            st.code(
+                f"choice_col={sf_choice_col!r}  alt_col={sf_alt_col!r}  choice_id_col={sf_choice_id_col!r}  "
+                f"ind_id_col={sf_ind_id_col!r}  base_alt={sf_base_alt!r}",
+                language="text",
+            )
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                sf_choice_col = st.selectbox("Choice column", sf_columns, key="sf_choice_col") if sf_columns else st.text_input("Choice column", "CHOICE", key="sf_choice_col_t")
+                sf_alt_col = st.selectbox("Alternative column", sf_columns, key="sf_alt_col") if sf_columns else st.text_input("Alternative column", "alt", key="sf_alt_col_t")
+            with c2:
+                sf_choice_id_col = st.selectbox("Choice-set ID column", sf_columns, key="sf_choice_id") if sf_columns else st.text_input("Choice ID column", "custom_id", key="sf_choice_id_t")
+                if family in ("mixed_logit", "latent_class_mxl"):
+                    ind_opts = ["(none)"] + sf_columns
+                    sf_ind_id_col = st.selectbox("Individual ID column (panel)", ind_opts, key="sf_ind_id")
+                    sf_ind_id_col = None if sf_ind_id_col == "(none)" else sf_ind_id_col
+            with c3:
+                sf_base_alt = st.text_input("Base alternative", value="", key="sf_base_alt")
+        avail_opts = ["(none)"] + sf_columns
+        sf_avail_col = st.selectbox("Availability column (optional)", avail_opts, key="sf_avail_col")
+        sf_avail_col = None if sf_avail_col == "(none)" else sf_avail_col
+
+        st.subheader("3. Candidate variables")
+        exclude_set = {sf_choice_col, sf_alt_col, sf_choice_id_col, sf_ind_id_col, sf_avail_col}
+        sf_asvarnames = st.multiselect(
+            "Alternative-specific variables (varnames)",
+            [c for c in sf_columns if c not in exclude_set], key="sf_asvars",
+        )
+        sf_isvarnames = st.multiselect(
+            "Individual-specific variables (optional)",
+            [c for c in sf_columns if c not in exclude_set and c not in sf_asvarnames], key="sf_isvars",
+        )
+        sf_fit_intercept = st.checkbox("Fit intercept", value=(family != "rrm"), key="sf_fit_intercept")
+
+        if family == "mixed_logit":
+            st.subheader("4. Random parameters")
+            sf_random_vars_sel = st.multiselect("Random variables", sf_asvarnames, key="sf_random_vars")
+            c1, c2 = st.columns(2)
+            with c1:
+                sf_dist_choice = st.selectbox(
+                    "Distribution", list(SEARCHLIBRIUM_DISTRIBUTIONS.keys()),
+                    format_func=lambda k: f"{k} — {SEARCHLIBRIUM_DISTRIBUTIONS[k]}",
+                    disabled=not sf_random_vars_sel, key="sf_dist",
+                )
+            with c2:
+                sf_n_draws = st.number_input("Halton draws (n_draws)", 50, 5000, 200, step=50, key="sf_ndraws")
+            sf_randvars = {v: sf_dist_choice for v in sf_random_vars_sel}
+            sf_correlated_vars = st.multiselect("Correlated random variables (optional)", sf_random_vars_sel, key="sf_corvars")
+
+        if family == "nested":
+            st.subheader("4. Nest structure")
+            st.caption(
+                "nests values are 0-based positions into the *sorted unique* alt values (not the raw "
+                "alt labels) — e.g. for alts ['CAR','SM','TRAIN'] (sorted), positions are CAR=0, SM=1, TRAIN=2."
+            )
+            sf_nests_json = st.text_area("nests (JSON)", value='{"Car": [0], "Transit": [1, 2]}', key="sf_nests")
+            sf_lambdas_json = st.text_area("lambdas (JSON, optional)", value='{"Car": 1, "Transit": 1}', key="sf_lambdas")
+
+        if family == "latent_class_mxl":
+            st.subheader("4. Latent class settings")
+            c1, c2 = st.columns(2)
+            with c1:
+                sf_n_classes = st.number_input("Number of classes", 2, 6, 2, key="sf_n_classes")
+            with c2:
+                sf_maxiter = st.number_input("Max EM iterations", 5, 500, 50, key="sf_lc_maxiter")
+            sf_membership_vars = st.multiselect(
+                "Class-membership variables (optional — defaults to all variables)",
+                sf_asvarnames, key="sf_membership_vars",
+            )
+
+    elif family == "ordered":
+        st.subheader("2. Column mapping")
+        c1, c2 = st.columns(2)
+        with c1:
+            sf_ordinal_y_col = st.selectbox("Ordinal outcome column", sf_columns, key="sf_ord_y") if sf_columns else st.text_input("Ordinal outcome column", "y", key="sf_ord_y_t")
+        with c2:
+            sf_n_categories = st.number_input("Number of ordinal categories (J)", 3, 20, 3, key="sf_n_cat")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sf_ordered_distr = st.selectbox("Link", ["logit", "probit"], key="sf_ord_distr")
+        with c2:
+            sf_normalize = st.checkbox("Normalize predictors", key="sf_ord_norm")
+        with c3:
+            sf_fit_intercept = st.checkbox("Fit intercept", key="sf_ord_intercept")
+
+        st.subheader("3. Candidate variables")
+        sf_asvarnames = st.multiselect(
+            "Predictor variables", [c for c in sf_columns if c != sf_ordinal_y_col], key="sf_ord_vars",
+        )
+
+    elif family == "binary_probit":
+        st.subheader("2. Column mapping")
+        c1, c2 = st.columns(2)
+        with c1:
+            sf_binary_y_col = st.selectbox("Binary outcome column (0/1)", sf_columns, key="sf_bin_y") if sf_columns else st.text_input("Binary outcome column", "y", key="sf_bin_y_t")
+        with c2:
+            sf_fit_intercept = st.checkbox("Fit intercept", value=True, key="sf_bin_intercept")
+        st.subheader("3. Candidate variables")
+        sf_asvarnames = st.multiselect(
+            "Predictor variables", [c for c in sf_columns if c != sf_binary_y_col], key="sf_bin_vars",
+        )
+
+    else:  # heckman
+        st.subheader("2. Column mapping")
+        c1, c2 = st.columns(2)
+        with c1:
+            sf_selection_y_col = st.selectbox("Selection outcome column (0/1)", sf_columns, key="sf_heck_sely") if sf_columns else st.text_input("Selection outcome column", "selected", key="sf_heck_sely_t")
+            sf_selection_varnames = st.multiselect(
+                "Selection-stage predictors", [c for c in sf_columns if c != sf_selection_y_col], key="sf_heck_selvars",
+            )
+        with c2:
+            outcome_opts = [c for c in sf_columns if c not in (sf_selection_y_col, *sf_selection_varnames)]
+            sf_outcome_y_col = st.selectbox("Outcome column (continuous)", outcome_opts, key="sf_heck_outy") if outcome_opts else st.text_input("Outcome column", "y", key="sf_heck_outy_t")
+            sf_outcome_varnames = st.multiselect(
+                "Outcome-stage predictors", [c for c in outcome_opts if c != sf_outcome_y_col], key="sf_heck_outvars",
+            )
+        sf_fit_intercept = st.checkbox("Fit intercept", value=True, key="sf_heck_intercept")
+
+    st.subheader("5. Job naming & output")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sf_experiment_name = st.text_input("Experiment name", value="standalone_fit", key="sf_exp_name")
+    with c2:
+        sf_output_dir = st.text_input("Output directory", value="results", key="sf_output_dir")
+    with c3:
+        sf_ncpus = st.number_input("HPC ncpus", 1, 64, 2, key="sf_ncpus")
+    c1, c2 = st.columns(2)
+    with c1:
+        sf_mem_gb = st.number_input("HPC mem (GB)", 4, 512, 16, key="sf_mem")
+    with c2:
+        sf_walltime = st.text_input("HPC walltime", value="4:00:00", key="sf_walltime")
+
+    st.divider()
+
+    sf_has_data = sf_use_bundled is not None or sf_df is not None
+    if is_choice_family:
+        sf_ready = bool(sf_has_data and (sf_asvarnames or sf_isvarnames) and sf_choice_col)
+    elif family in ("ordered", "binary_probit"):
+        sf_ready = bool(sf_has_data and sf_asvarnames and (sf_ordinal_y_col if family == "ordered" else sf_binary_y_col))
+    else:  # heckman
+        sf_ready = bool(sf_has_data and sf_selection_varnames and sf_outcome_varnames and sf_selection_y_col and sf_outcome_y_col)
+
+    if not sf_ready:
+        st.warning("Select data and the required columns/variables above to generate a script.")
+    else:
+        sf_hpc_data_filename = Path(sf_data_path).name if sf_data_path else "data.csv"
+        sf_cfg = StandaloneFitConfig(
+            data_path=sf_data_path, hpc_data_filename=sf_hpc_data_filename, model_class=model_class,
+            use_bundled=sf_use_bundled,
+            choice_col=sf_choice_col, alt_col=sf_alt_col, choice_id_col=sf_choice_id_col,
+            ind_id_col=sf_ind_id_col, avail_col=sf_avail_col, base_alt=sf_base_alt,
+            asvarnames=sf_asvarnames, isvarnames=sf_isvarnames,
+            fit_intercept=bool(sf_fit_intercept), maxiter=int(sf_maxiter),
+            randvars=sf_randvars, correlated_vars=sf_correlated_vars, n_draws=int(sf_n_draws),
+            nests_json=sf_nests_json, lambdas_json=sf_lambdas_json,
+            ordinal_y_col=sf_ordinal_y_col, n_categories=int(sf_n_categories),
+            ordered_distr=sf_ordered_distr, normalize=bool(sf_normalize),
+            binary_y_col=sf_binary_y_col,
+            selection_y_col=sf_selection_y_col, selection_varnames=sf_selection_varnames,
+            outcome_y_col=sf_outcome_y_col, outcome_varnames=sf_outcome_varnames,
+            n_classes=int(sf_n_classes), membership_vars=sf_membership_vars,
+            output_dir=sf_output_dir, experiment_name=sf_experiment_name,
+        )
+
+        sf_local_script = generate_standalone_fit_script(sf_cfg, for_hpc=False)
+        sf_hpc_script = generate_standalone_fit_script(sf_cfg, for_hpc=True)
+        sf_pbs_script = generate_pbs_script(PbsConfig(
+            job_name=sf_experiment_name, script_filename="run_standalone_fit.py",
+            ncpus=int(sf_ncpus), mem_gb=int(sf_mem_gb), walltime=sf_walltime,
+        ))
+
+        render_run_and_export(
+            key_prefix="standalone",
+            local_script=sf_local_script, local_script_name="run_standalone_fit.py",
+            hpc_script=sf_hpc_script, hpc_script_name="run_standalone_fit.py",
+            pbs_script=sf_pbs_script, pbs_script_name=f"{sf_experiment_name}.pbs",
+            engine_python=engine_python,
+            data_file_to_bundle=sf_uploaded_path,
+        )

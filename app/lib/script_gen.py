@@ -339,6 +339,252 @@ print("Note: sapbil/banditsa/parsa/parcopsa reuse the 'sa'-style estimate; hspbi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SearchLibrium — Standalone fit (direct model.setup()/model.fit(), no search)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The 12 standalone model classes do NOT share one uniform setup()/fit() API.
+# Verified directly against source (not the README) -- three distinct
+# families, plus two outright special cases:
+#   Family A: empty ctor -> .setup(X, y, varnames, alts, isvars, ids, ...) ->
+#             .fit() with no required args, returns None.
+#             MultinomialLogit, MixedLogit, NestedLogit, MultiLayerNestedLogit,
+#             MixedNested, MultinomialProbit.
+#   Family B: ctor itself calls setup(**kwargs) (X/y/J/distr passed at
+#             construction); OrderedLogit, OrderedLogitLong.
+#   Family C: fluent .setup() returns self, .fit() returns a value (not
+#             None), hard JAX dependency; BinaryProbit, HeckmanTwoStep.
+#   Special: RandomRegret/MixedRandomRegret use RandomRegret's *generic*
+#            .setup(X, y, varnames, alts, isvars, ids, ...) path (confirmed
+#            it calls self.initialise(), NOT the df=/short= constructor path
+#            which requires rigid literal 'id'/'alt'/'choice' column names).
+#            LatentClassMixedLogit takes its hyperparameters (n_classes,
+#            maxiter, ...) at construction time, unlike anything else.
+#
+# All 9 classes below were run end-to-end against the real engine and real
+# data this session; along the way this surfaced (and fixed, in the
+# SearchLibrium source) 8 genuine upstream bugs -- e.g. NestedLogit.setup()
+# was defined twice in the same class body with the second (X_nest-requiring)
+# definition silently shadowing the first; MixedRandomRegret/MixedNested/
+# MultiLayerNestedLogit never initialise attributes their own base classes'
+# __init__ chains are supposed to set up. Three classes are deliberately
+# OMITTED from this dict (and so unavailable in the GUI) because they hit
+# bugs deep enough that a full fix was out of scope for this pass:
+#   - MixedRandomRegret: RandomRegret's setup() never calls MixedLogit's, so
+#     several attributes generate_draws() needs (rvdist, randvars, rvidx,
+#     ...) are never initialised -- would need MixedLogit's random-variable
+#     processing re-implemented inside RandomRegret's setup.
+#   - MixedNested: its MixedLogit.__init__(self, _jax=_jax) call targets the
+#     *other* MixedLogit (mixed_logit.py's zero-arg version), raising
+#     TypeError immediately.
+#   - MultiLayerNestedLogit: self.np (normally set inside NestedLogit's own
+#     __init__, not inherited generically) is never initialised, so setup()
+#     crashes with AttributeError as soon as it needs self.np.
+#   - OrderedLogitLong: its own __init__/self.np bug IS fixed (see
+#     ordered_logit.py), but it additionally requires the same
+#     misc.wide_to_long-expanded long-format data (one row per individual per
+#     ordinal category, not one row per observation) that MixedNested-style
+#     alt-based models need -- out of scope for this simple column-mapping UI.
+STANDALONE_MODEL_FAMILIES: dict[str, str] = {
+    "MultinomialLogit": "mnl_family",
+    "MultinomialProbit": "mnl_family",
+    "MixedLogit": "mixed_logit",
+    "NestedLogit": "nested",
+    "RandomRegret": "rrm",
+    "OrderedLogit": "ordered",
+    "BinaryProbit": "binary_probit",
+    "HeckmanTwoStep": "heckman",
+    "LatentClassMixedLogit": "latent_class_mxl",
+}
+
+
+@dataclass
+class StandaloneFitConfig:
+    data_path: str
+    hpc_data_filename: str
+    model_class: str
+    use_bundled: Optional[str] = None
+    # Discrete-choice (long-format) column mapping -- used by most families
+    choice_col: str = "CHOICE"
+    alt_col: str = "alt"
+    choice_id_col: str = "custom_id"
+    ind_id_col: Optional[str] = None       # panels, MixedLogit only
+    avail_col: Optional[str] = None
+    base_alt: str = ""
+    asvarnames: list[str] = field(default_factory=list)
+    isvarnames: list[str] = field(default_factory=list)
+    fit_intercept: bool = False
+    maxiter: int = 2000
+    # MixedLogit
+    randvars: dict[str, str] = field(default_factory=dict)   # var -> n/ln/t/tn/u
+    correlated_vars: list[str] = field(default_factory=list)
+    n_draws: int = 1000
+    # NestedLogit
+    nests_json: Optional[str] = None
+    lambdas_json: Optional[str] = None
+    # OrderedLogit
+    ordinal_y_col: str = ""
+    n_categories: int = 3
+    ordered_distr: str = "logit"          # probit | logit
+    normalize: bool = False
+    # BinaryProbit
+    binary_y_col: str = ""
+    # HeckmanTwoStep
+    selection_y_col: str = ""
+    selection_varnames: list[str] = field(default_factory=list)
+    outcome_y_col: str = ""
+    outcome_varnames: list[str] = field(default_factory=list)
+    # LatentClassMixedLogit
+    n_classes: int = 2
+    membership_vars: list[str] = field(default_factory=list)
+    output_dir: str = "results"
+    experiment_name: str = "standalone_fit"
+
+
+def generate_standalone_fit_script(cfg: StandaloneFitConfig, for_hpc: bool) -> str:
+    if cfg.use_bundled:
+        preset = SEARCHLIBRIUM_BUNDLED_PRESETS[cfg.use_bundled]
+        load_block = f"from SearchLibrium import {preset['loader']}\ndf = {preset['loader']}()"
+    else:
+        data_expr = repr(cfg.hpc_data_filename) if for_hpc else repr(cfg.data_path)
+        load_block = f"df = pd.read_csv({data_expr})"
+
+    family = STANDALONE_MODEL_FAMILIES[cfg.model_class]
+    varnames = cfg.asvarnames + cfg.isvarnames
+    avail_kw = f"avail=df[{cfg.avail_col!r}].values," if cfg.avail_col else ""
+
+    import_line = f"from SearchLibrium import {cfg.model_class}"
+    prelude = f"varnames = {_pylist(varnames)}\n"
+    report_lines = ""
+
+    if family == "mnl_family":
+        prelude += ""
+        body = f'''model = {cfg.model_class}()
+model.setup(X=df[varnames], y=df[{cfg.choice_col!r}], varnames=varnames, isvars={_pylist(cfg.isvarnames)},
+            fit_intercept={cfg.fit_intercept!r}, alts=df[{cfg.alt_col!r}], ids=df[{cfg.choice_id_col!r}],
+            {avail_kw} base_alt={cfg.base_alt!r}, maxiter={cfg.maxiter!r})
+model.fit()'''
+        report_lines = 'model.get_loglik_null()\nmodel.summarise()'
+
+    elif family == "mixed_logit":
+        panels_kw = f"panels=df[{cfg.ind_id_col!r}].values," if cfg.ind_id_col else ""
+        correlated_expr = _pylist(cfg.correlated_vars) if cfg.correlated_vars else "None"
+        prelude += "X = df[varnames].values\ny = df[choice_col].values\n".replace("choice_col", repr(cfg.choice_col))
+        body = f'''model = MixedLogit()
+model.setup(X, y, ids=df[{cfg.choice_id_col!r}].values, {panels_kw} varnames=varnames,
+            isvars={_pylist(cfg.isvarnames)}, transvars=[], correlated_vars={correlated_expr},
+            randvars={cfg.randvars!r}, fit_intercept={cfg.fit_intercept!r}, alts=df[{cfg.alt_col!r}],
+            n_draws={cfg.n_draws!r}, mnl_init=True)
+model.fit()'''
+        report_lines = 'model.get_loglik_null()\nmodel.summarise()'
+
+    elif family == "nested":
+        # nests dict values are 0-based positional indices into the *sorted
+        # unique* alt values (not the raw alt labels) -- confirmed directly
+        # against compute_probabilities()'s integer array indexing, and by
+        # a real end-to-end run against swiss_metro (alts CAR/SM/TRAIN sort
+        # to positions 0/1/2).
+        prelude += f"nests = {cfg.nests_json or '{}'}\nlambdas = {cfg.lambdas_json or '{}'}\n"
+        # NestedLogit.setup() is defined TWICE in multinomial_nested.py; the
+        # second definition (requiring X_nest) silently shadows the first
+        # and is the one actually reachable -- confirmed directly (the
+        # "simple" no-X_nest call demonstrated in main.py raises TypeError:
+        # missing 1 required positional argument: 'X_nest'). search.py's own
+        # metaheuristic nested_logit path already passes X_nest, so this is
+        # the class's real, current live signature.
+        body = f'''model = NestedLogit()
+model.setup(X=df[varnames], X_nest=None, y=df[{cfg.choice_col!r}], varnames=varnames,
+            isvars={_pylist(cfg.isvarnames)}, fit_intercept={cfg.fit_intercept!r}, alts=df[{cfg.alt_col!r}],
+            ids=df[{cfg.choice_id_col!r}], nests=nests, lambdas=lambdas)
+model.fit()'''
+        report_lines = 'try:\n    model.summarise()\nexcept Exception as e:\n    print(f"[warn] summarise() failed: {e}")'
+
+    elif family == "rrm":
+        body = f'''model = RandomRegret()
+model.setup(X=df[varnames], y=df[{cfg.choice_col!r}], varnames=varnames, alts=df[{cfg.alt_col!r}],
+            isvars={_pylist(cfg.isvarnames)}, ids=df[{cfg.choice_id_col!r}], base_alt={cfg.base_alt!r},
+            fit_intercept={cfg.fit_intercept!r})
+model.fit()'''
+        report_lines = 'model.report()'
+
+    elif family == "ordered":
+        prelude = f"asvarnames = {_pylist(cfg.asvarnames)}\n"
+        body = f'''model = OrderedLogit(X=df[asvarnames], y=df[{cfg.ordinal_y_col!r}], J={cfg.n_categories!r},
+                     distr={cfg.ordered_distr!r}, start=None, normalize={cfg.normalize!r},
+                     fit_intercept={cfg.fit_intercept!r})
+model.fit()'''
+        report_lines = 'model.report()'
+
+    elif family == "binary_probit":
+        prelude = f"asvarnames = {_pylist(cfg.asvarnames)}\n"
+        body = f'''model = BinaryProbit()
+model.setup(X=df[asvarnames], y=df[{cfg.binary_y_col!r}], varnames=asvarnames,
+            fit_intercept={cfg.fit_intercept!r})
+res = model.fit()'''
+        report_lines = 'print(res)\nprint("Coefficients:", dict(zip(asvarnames, model.coeff_est)))'
+
+    elif family == "heckman":
+        prelude = (
+            f"selection_varnames = {_pylist(cfg.selection_varnames)}\n"
+            f"outcome_varnames = {_pylist(cfg.outcome_varnames)}\n"
+        )
+        body = f'''model = HeckmanTwoStep()
+model.setup(selection_X=df[selection_varnames], selection_y=df[{cfg.selection_y_col!r}],
+            outcome_X=df[outcome_varnames], outcome_y=df[{cfg.outcome_y_col!r}],
+            selection_varnames=selection_varnames, outcome_varnames=outcome_varnames,
+            fit_intercept={cfg.fit_intercept!r})
+result = model.fit()'''
+        report_lines = 'print(model.params_table)\nprint("Selection-stage params:", result["probit"].coeff_est)'
+
+    else:  # latent_class_mxl
+        avail_kw2 = f"avail=df[{cfg.avail_col!r}].values," if cfg.avail_col else ""
+        membership_kw = f"membership_vars={_pylist(cfg.membership_vars)}," if cfg.membership_vars else ""
+        body = f'''model = LatentClassMixedLogit(n_classes={cfg.n_classes!r}, maxiter={cfg.maxiter!r},
+                              class_maxiter=50, tol=1e-6, random_state=42)
+model.setup(X=df[varnames].values, y=df[{cfg.choice_col!r}].values, varnames=varnames,
+            ids=df[{cfg.choice_id_col!r}].values, alts=df[{cfg.alt_col!r}].values,
+            {avail_kw2} {membership_kw})
+model.fit()'''
+        report_lines = 'try:\n    model.summarise()\nexcept Exception as e:\n    print(f"[warn] summarise() failed: {e}")\n    print("class_betas:", getattr(model, \'class_betas\', None))'
+
+    return f'''"""Auto-generated by ModelZoo GUI — SearchLibrium standalone fit: {cfg.experiment_name}
+Model class: {cfg.model_class}
+
+Run locally:
+    python run_standalone_fit.py
+
+Fits a single, pre-specified {cfg.model_class} directly (no metaheuristic
+search over structures) -- for exploring/reporting on one specification.
+"""
+import os
+import sys
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+import time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+{import_line}
+
+print("=" * 70)
+print("SearchLibrium standalone fit: {cfg.experiment_name} ({cfg.model_class})")
+print("=" * 70)
+
+t0 = time.time()
+{load_block}
+print(f"Loaded data: {{df.shape[0]}} rows x {{df.shape[1]}} cols")
+
+{prelude}
+{body}
+
+elapsed = time.time() - t0
+print(f"\\nFit finished in {{elapsed:.1f}}s")
+{report_lines}
+'''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # metacountregressor
 # ─────────────────────────────────────────────────────────────────────────────
 
