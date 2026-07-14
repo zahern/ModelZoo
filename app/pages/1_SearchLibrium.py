@@ -11,8 +11,10 @@ from lib.script_gen import (
     SEARCHLIBRIUM_BUNDLED_PRESETS,
     SEARCHLIBRIUM_DISTRIBUTIONS,
     generate_searchlibrium_script,
+    generate_searchlibrium_ctrl_preview,
 )
 from lib.ui_common import render_exclusive_groups, render_pool_rules, render_run_and_export
+from lib.runner import stream_run
 
 st.set_page_config(page_title="SearchLibrium — ModelZoo", page_icon="🔎", layout="wide")
 st.title("🔎 SearchLibrium runner")
@@ -142,16 +144,32 @@ c1, c2, c3 = st.columns(3)
 with c1:
     models = st.multiselect(
         "Model types to search over",
-        ["multinomial", "mixed_logit", "random_regret", "mixed_random_regret", "nested_logit", "ordered_logit"],
+        ["multinomial", "mixed_logit", "random_regret", "mixed_random_regret",
+         "nested_logit", "mixed_nested", "ordered_logit"],
         default=["multinomial"],
+        help="mixed_nested needs allow_random + nests/lambdas below, same as nested_logit.",
     )
     criterion = st.selectbox("Objective (minimise)", ["bic", "aic", "loglik"])
+    mae_enabled = st.checkbox(
+        "Add MAE as a second objective (multi-objective)",
+        help="Auto-splits the data into train/test by individual (val_share below) unless "
+             "you're already passing your own held-out set — see SearchLibrium's Parameters(df_test=...).",
+    )
+    val_share = st.number_input("Held-out share for MAE", 0.05, 0.5, 0.25, step=0.05, disabled=not mae_enabled)
 with c2:
-    allow_random = st.checkbox("Allow random parameters", value="mixed_logit" in models or "mixed_random_regret" in models)
+    allow_random = st.checkbox("Allow random parameters", value="mixed_logit" in models or "mixed_random_regret" in models or "mixed_nested" in models)
     allow_bcvars = st.checkbox("Allow Box-Cox transforms")
     allow_corvars = st.checkbox("Allow correlated random parameters")
+    latent_class = st.checkbox("Latent class model", help="Every solution in the search is fit as latent-class, regardless of the model types picked above.")
+    num_classes = st.number_input("Number of classes", 2, 6, 2, disabled=not latent_class)
 with c3:
-    algorithm = st.selectbox("Search algorithm", ["sa", "hs", "sapbil", "banditsa", "hspbil"])
+    algorithm = st.selectbox(
+        "Search algorithm",
+        ["sa", "hs", "sapbil", "banditsa", "hspbil", "parsa", "parcopsa"],
+        help="parsa/parcopsa run nthrds independent SA solvers in parallel threads; "
+             "parcopsa additionally shares the best solution across solvers periodically.",
+    )
+    nthrds = st.number_input("Parallel threads (nthrds)", 2, 16, 4, disabled=algorithm not in ("parsa", "parcopsa"))
     p_val = st.number_input("Significance threshold (p_val)", 0.001, 0.5, 0.05, step=0.01)
     seed = st.number_input("Run ID / seed", 1, 999999, 1)
 
@@ -162,8 +180,8 @@ with c2:
     maxiter = st.number_input("Max MLE iterations per fit (maxiter)", 50, 10000, 2000, step=50)
 
 nests_json = lambdas_json = None
-if "nested_logit" in models:
-    st.caption("Nested logit requires nest structure, e.g. `{\"PublicTransport\": [0, 1], \"Private\": [2, 3]}`")
+if "nested_logit" in models or "mixed_nested" in models:
+    st.caption("Nested/mixed-nested logit require nest structure, e.g. `{\"PublicTransport\": [0, 1], \"Private\": [2, 3]}`")
     nests_json = st.text_area("nests (JSON)", value='{"nest_1": [0, 1]}')
     lambdas_json = st.text_area("lambdas (JSON)", value='{"nest_1": 0.8}')
 
@@ -198,12 +216,29 @@ else:
         asvarnames=asvarnames, isvarnames=isvarnames,
         models=models, allow_random=allow_random, allow_bcvars=allow_bcvars,
         allow_corvars=allow_corvars, p_val=p_val, n_draws=int(n_draws), maxiter=int(maxiter),
-        criterion=criterion, algorithm=algorithm, seed=int(seed),
+        criterion=criterion, mae_enabled=mae_enabled, val_share=val_share,
+        algorithm=algorithm, nthrds=int(nthrds), seed=int(seed),
         nests_json=nests_json, lambdas_json=lambdas_json,
+        latent_class=latent_class, num_classes=int(num_classes),
         output_dir=output_dir, experiment_name=experiment_name,
         use_bundled=use_bundled,
         constraints=constraints_cfg,
     )
+
+    with st.expander("Preview auto-estimated hyperparameters (before running)"):
+        st.caption("Runs `estimate_ctrl()` against your data/spec only — no search, seconds not minutes.")
+        if st.button("Preview hyperparameters", key="sl_ctrl_preview"):
+            preview_script = generate_searchlibrium_ctrl_preview(cfg)
+            job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_ctrl_preview"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            script_path = job_dir / "ctrl_preview.py"
+            script_path.write_text(preview_script, encoding="utf-8")
+            lines: list[str] = []
+            console = st.empty()
+            with st.spinner("Estimating..."):
+                for line in stream_run(engine_python, str(script_path), cwd=str(job_dir)):
+                    lines.append(line)
+                    console.code("\n".join(lines[-100:]), language="text")
 
     local_script = generate_searchlibrium_script(cfg, for_hpc=False)
     hpc_script = generate_searchlibrium_script(cfg, for_hpc=True)
