@@ -94,16 +94,75 @@ Ctrl+C in the terminal running `streamlit run`, or close the terminal/process.
 ## Layout
 
 - `app/Home.py` — landing page, engine interpreter configuration + smoke-test status
-- `app/pages/1_SearchLibrium.py` — discrete-choice model search runner
-- `app/pages/2_MetaCountRegressor.py` — count/CMF/duration/linear model search runner
+- `app/pages/1_SearchLibrium.py` — discrete-choice model search runner, in four tabs:
+  **Structure search** (metaheuristic search over model structures), **Standalone fit** (fit one
+  pre-specified model directly, no search — 9 model classes, see below), **MDCEV budget
+  allocation** (`MDCEVModel`, continuous budget-split forecasting), and **Destination/flow
+  prediction** (`DestinationPredictor` — predict per-trip destination + aggregate flows)
+- `app/pages/2_MetaCountRegressor.py` — count/CMF/duration/linear model search runner, in three
+  tabs: **Count / Duration / Linear** (the original structure search), **CMF** (Crash Modification
+  Function search — GA mode with the traditional CMF interpretation table, or a JAX-flexible mode
+  with full `ModelConstraints` + latent classes), and **Pavement deterioration** (clusterwise
+  log-log regression search + temporal error-structure comparison, `PavementCLROptimizer`)
 - `app/pages/3_ABM.py` — ABM pipeline runner (`Z:\test_runs_tours\code`): modes, strategies, HPC commands
+- `app/pages/4_Results_Dashboard.py` — browse a completed run's output directory: convergence
+  charts + best-specification table for SearchLibrium's `sa_runs/`, or the JSON summary for a
+  metacountregressor run
 - `app/lib/env.py` — engine interpreter discovery + package probing
 - `app/lib/abm.py` — ABM mode/strategy metadata + local/qsub command builders
 - `app/lib/script_gen.py` — generates the standalone Python run-scripts
+- `app/lib/results_parser.py` — parses SearchLibrium `sa_runs/` output and metacountregressor JSON
+  result files for the Results Dashboard page
 - `app/lib/pbs_gen.py` — generates matching PBS job files
 - `app/lib/runner.py` — subprocess execution with streamed output
 - `app/lib/ui_common.py` — shared preview/run/export UI
 - `generated_jobs/` — local run outputs and uploaded data (gitignored)
+
+## SearchLibrium — Standalone fit
+
+Fits one pre-specified model directly via its own `setup()`/`fit()` — no metaheuristic search.
+9 of the 12 documented standalone model classes are supported, each verified end-to-end against
+the real engine: `MultinomialLogit`, `MultinomialProbit`, `MixedLogit`, `NestedLogit`,
+`RandomRegret`, `OrderedLogit`, `BinaryProbit`, `HeckmanTwoStep`, `LatentClassMixedLogit`.
+`MixedRandomRegret`, `MixedNested`, and `MultiLayerNestedLogit` are deliberately omitted — each
+hits a deeper constructor-chain bug (a missing attribute that a base class's `__init__` is
+supposed to set up) that needs more than a quick fix; `OrderedLogitLong` is omitted because it
+needs long/expanded panel data (`misc.wide_to_long`-style, one row per individual per ordinal
+category) that doesn't fit this simple column-mapping UI — use `OrderedLogit` instead for
+standard one-row-per-observation data. See the comment above `STANDALONE_MODEL_FAMILIES` in
+`script_gen.py` for the full detail on why each is excluded.
+
+## SearchLibrium — MDCEV budget allocation
+
+Drives `MDCEVModel`, a translated-utility MDCEV-style allocator for continuous budget splits
+(e.g. daily time-use minutes or discretionary spend across categories): heuristic (fast,
+moment-based) or JAX-autodiff quasi-MLE fit, deterministic `predict()` and stochastic
+`simulate()` (Gumbel utility shocks) for one or more budget levels. Deterministic `predict()` can
+show corner solutions (100% to one alternative, typically the outside good) when its `gamma` is
+small relative to the others — this is expected translated-utility MDCEV behaviour given how the
+heuristic fit treats the outside good (forced to near-zero satiation), not a bug; use `simulate()`
+for realistic diversified predictions.
+
+## SearchLibrium — Destination/flow prediction
+
+Drives `DestinationPredictor`: fits a discrete-choice model on trip-level destination-choice data
+(long format — one row per trip per candidate destination) and predicts the most likely
+destination per trip plus aggregate flows per destination against the observed data. Supports
+`MultinomialLogit`, `MixedLogit`, `NestedLogit` (`RandomRegret` has no `compute_probabilities()`/
+`ind_pred_prob`, so it's fundamentally incompatible with this tool by design). The generated
+script always fits and predicts over the exact same dataset in one run — `DestinationPredictor`
+reuses the fitted model's cached probability arrays whenever their shape matches, so predicting
+on a genuinely different dataset than the model was fit on can silently return stale results;
+fitting and predicting together sidesteps that by construction. If you need true out-of-sample
+prediction, refit the model on the exact evaluation dataset first.
+
+## Results dashboard
+
+Point the **SearchLibrium (sa_runs)** tab at a search's `sa_runs/` output directory (or a specific
+`sa_runs/sa_<id>_<timestamp>/` run) for convergence charts (best/current objective + temperature
+vs. step), the best specification, and — for multi-objective runs — the Pareto archive with a
+2D trade-off scatter plot. The **metacountregressor (JSON)** tab reads the JSON summary written by
+`SearchOutputConfig(save_json=True)`.
 
 ## ABM page
 
@@ -166,3 +225,17 @@ routed through it). Both are fixed in `search.py` in the local source checkout; 
 real search where a `mutually_exclusive(['COST','HEADWAY'])` group is now actually enforced
 (previously both appeared together in the result regardless). Until a new PyPI release ships
 this, constraints only work with an editable/source install of SearchLibrium.
+
+**More upstream bugs found and fixed while building the Standalone fit / MDCEV / Results
+dashboard / Destination prediction tools** (each verified against a real run before/after,
+not just read from source): `NestedLogit.setup()` was defined twice in the same class body,
+with the second (undocumented, `X_nest`-requiring) definition silently shadowing the first;
+`MixedRandomRegret`'s `fit()` crashed immediately (`fn_generate_draws` never initialised);
+`OrderedLogit`/`OrderedLogitLong` had five separate JAX-immutability bugs across
+`fit()`/`get_hessian()`/`compute_stderr()`; `MDCEVModel.fit_mle()` left `summary()` reporting
+stale pre-refinement parameters; `DestinationPredictor.predict_destinations()` crashed on
+string-labelled destinations and — more seriously — ran orders of magnitude slower than it
+should (hours instead of seconds for a few thousand trips) because it left probabilities as an
+un-converted `jax.Array` before running plain-numpy `argsort`/`argmax` on them in a per-row
+Python loop. All fixed in the local SearchLibrium/metacountregressor source checkouts and
+pushed upstream; see the git history in those repos for full detail on each.
