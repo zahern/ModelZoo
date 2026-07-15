@@ -17,6 +17,9 @@ from lib.script_gen import (
     generate_standalone_fit_script,
     MDCEVConfig,
     generate_mdcev_script,
+    DestinationPredictionConfig,
+    DESTINATION_MODEL_FAMILIES,
+    generate_destination_prediction_script,
 )
 from lib.ui_common import render_exclusive_groups, render_pool_rules, render_run_and_export
 from lib.runner import stream_run
@@ -33,7 +36,9 @@ BUNDLED_LABELS = {
     "travel_mode": "travel_mode — air/train/bus/car mode choice, 4 alts",
 }
 
-tab_search, tab_standalone, tab_mdcev = st.tabs(["Structure search", "Standalone fit", "MDCEV budget allocation"])
+tab_search, tab_standalone, tab_mdcev, tab_destination = st.tabs(
+    ["Structure search", "Standalone fit", "MDCEV budget allocation", "Destination/flow prediction"]
+)
 
 with tab_search:
     st.subheader("1. Data")
@@ -675,4 +680,152 @@ with tab_mdcev:
             pbs_script=md_pbs_script, pbs_script_name=f"{md_experiment_name}.pbs",
             engine_python=engine_python,
             data_file_to_bundle=md_uploaded_path,
+        )
+
+with tab_destination:
+    st.caption(
+        "Fit a discrete-choice model on trip-level destination-choice data (long format: one row per "
+        "trip per candidate destination), then predict the most likely destination per trip and "
+        "aggregate flows per destination, compared against the observed data."
+    )
+    st.info(
+        "The fit and the prediction always run over the exact same dataset in one script. "
+        "SearchLibrium's `DestinationPredictor` reuses the fitted model's cached probability arrays "
+        "whenever their shape matches, so predicting on a *different* dataset than the model was fit "
+        "on can silently return stale results from the original fit — fitting and predicting together "
+        "avoids that by construction. If you need true out-of-sample prediction, refit the model on "
+        "the exact evaluation dataset first."
+    )
+
+    dp_model_class = st.selectbox("Model class", list(DESTINATION_MODEL_FAMILIES.keys()), key="dp_model_class")
+    dp_family = DESTINATION_MODEL_FAMILIES[dp_model_class]
+
+    st.subheader("1. Data")
+    dp_data_choice = st.radio("Data source", ["Upload CSV", "Path on disk"], horizontal=True, key="dp_data_choice")
+    dp_df: pd.DataFrame | None = None
+    dp_data_path = ""
+    dp_uploaded_path: Path | None = None
+    if dp_data_choice == "Upload CSV":
+        dp_up = st.file_uploader("CSV file", type=["csv"], key="dp_upload")
+        if dp_up is not None:
+            dp_job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_uploads"
+            dp_job_dir.mkdir(parents=True, exist_ok=True)
+            dp_uploaded_path = dp_job_dir / dp_up.name
+            dp_uploaded_path.write_bytes(dp_up.getvalue())
+            dp_data_path = str(dp_uploaded_path)
+            dp_df = pd.read_csv(dp_uploaded_path)
+            st.dataframe(dp_df.head(20), use_container_width=True, height=200)
+        dp_columns = list(dp_df.columns) if dp_df is not None else []
+    else:
+        dp_data_path = st.text_input("CSV path (must be readable by the engine interpreter)", value="", key="dp_path")
+        if dp_data_path and Path(dp_data_path).exists():
+            try:
+                dp_df = pd.read_csv(dp_data_path, nrows=5000)
+                st.dataframe(dp_df.head(20), use_container_width=True, height=200)
+            except Exception as e:
+                st.warning(f"Could not preview file: {e}")
+        dp_columns = list(dp_df.columns) if dp_df is not None else []
+
+    if not dp_columns:
+        st.info("Provide data to continue.")
+
+    st.subheader("2. Column mapping")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        dp_trip_id_col = st.selectbox("Trip ID column", dp_columns, key="dp_trip_id") if dp_columns else st.text_input("Trip ID column", "trip_id", key="dp_trip_id_t")
+        dp_dest_col = st.selectbox("Destination column", dp_columns, key="dp_dest_col") if dp_columns else st.text_input("Destination column", "dest_code", key="dp_dest_col_t")
+    with c2:
+        dp_choice_col = st.selectbox("Chosen indicator column (0/1)", dp_columns, key="dp_choice_col") if dp_columns else st.text_input("Chosen column", "chosen", key="dp_choice_col_t")
+        dest_name_opts = ["(none)"] + dp_columns
+        dp_dest_name_col = st.selectbox("Destination name column (optional)", dest_name_opts, key="dp_dest_name_col")
+        dp_dest_name_col = None if dp_dest_name_col == "(none)" else dp_dest_name_col
+    with c3:
+        dp_base_alt = st.text_input("Base alternative (for the fit)", value="", key="dp_base_alt")
+        avail_opts = ["(none)"] + dp_columns
+        dp_avail_col = st.selectbox("Availability column (optional)", avail_opts, key="dp_avail_col")
+        dp_avail_col = None if dp_avail_col == "(none)" else dp_avail_col
+
+    st.subheader("3. Candidate variables")
+    dp_exclude = {dp_trip_id_col, dp_dest_col, dp_choice_col, dp_dest_name_col, dp_avail_col}
+    dp_varnames = st.multiselect(
+        "Alternative-specific variables used in the utility function",
+        [c for c in dp_columns if c not in dp_exclude], key="dp_varnames",
+    )
+    dp_isvarnames = st.multiselect(
+        "Individual-specific variables (optional)",
+        [c for c in dp_columns if c not in dp_exclude and c not in dp_varnames], key="dp_isvarnames",
+    )
+    dp_fit_intercept = st.checkbox("Fit intercept", value=True, key="dp_fit_intercept")
+
+    dp_randvars: dict[str, str] = {}
+    dp_n_draws = 200
+    dp_nests_json = dp_lambdas_json = None
+    if dp_family == "mixed_logit":
+        st.subheader("4. Random parameters")
+        dp_random_vars_sel = st.multiselect("Random variables", dp_varnames, key="dp_random_vars")
+        c1, c2 = st.columns(2)
+        with c1:
+            dp_dist_choice = st.selectbox(
+                "Distribution", list(SEARCHLIBRIUM_DISTRIBUTIONS.keys()),
+                format_func=lambda k: f"{k} — {SEARCHLIBRIUM_DISTRIBUTIONS[k]}",
+                disabled=not dp_random_vars_sel, key="dp_dist",
+            )
+        with c2:
+            dp_n_draws = st.number_input("Halton draws (n_draws)", 50, 5000, 200, step=50, key="dp_ndraws")
+        dp_randvars = {v: dp_dist_choice for v in dp_random_vars_sel}
+
+    if dp_family == "nested":
+        st.subheader("4. Nest structure")
+        st.caption(
+            "nests values are 0-based positions into the *sorted unique* destination values (not the "
+            "raw labels) — same convention as the Standalone fit tab's NestedLogit."
+        )
+        dp_nests_json = st.text_area("nests (JSON)", value='{"Car": [0], "Transit": [1, 2]}', key="dp_nests")
+        dp_lambdas_json = st.text_area("lambdas (JSON, optional)", value='{"Car": 1, "Transit": 1}', key="dp_lambdas")
+
+    st.subheader("5. Job naming & output")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        dp_experiment_name = st.text_input("Experiment name", value="destination_prediction", key="dp_exp_name")
+    with c2:
+        dp_output_dir = st.text_input("Output directory", value="results", key="dp_output_dir")
+    with c3:
+        dp_ncpus = st.number_input("HPC ncpus", 1, 64, 2, key="dp_ncpus")
+    c1, c2 = st.columns(2)
+    with c1:
+        dp_mem_gb = st.number_input("HPC mem (GB)", 4, 512, 16, key="dp_mem")
+    with c2:
+        dp_walltime = st.text_input("HPC walltime", value="4:00:00", key="dp_walltime")
+
+    st.divider()
+
+    dp_ready = bool(dp_df is not None and dp_varnames and dp_trip_id_col and dp_dest_col and dp_choice_col)
+    if not dp_ready:
+        st.warning("Select data, column mapping, and at least one candidate variable to generate a script.")
+    else:
+        dp_hpc_data_filename = Path(dp_data_path).name if dp_data_path else "data.csv"
+        dp_cfg = DestinationPredictionConfig(
+            data_path=dp_data_path, hpc_data_filename=dp_hpc_data_filename, model_class=dp_model_class,
+            trip_id_col=dp_trip_id_col, dest_col=dp_dest_col, choice_col=dp_choice_col,
+            dest_name_col=dp_dest_name_col, avail_col=dp_avail_col,
+            varnames=dp_varnames, isvarnames=dp_isvarnames, base_alt=dp_base_alt,
+            fit_intercept=bool(dp_fit_intercept), randvars=dp_randvars, n_draws=int(dp_n_draws),
+            nests_json=dp_nests_json, lambdas_json=dp_lambdas_json,
+            output_dir=dp_output_dir, experiment_name=dp_experiment_name,
+        )
+
+        dp_local_script = generate_destination_prediction_script(dp_cfg, for_hpc=False)
+        dp_hpc_script = generate_destination_prediction_script(dp_cfg, for_hpc=True)
+        dp_pbs_script = generate_pbs_script(PbsConfig(
+            job_name=dp_experiment_name, script_filename="run_destination_prediction.py",
+            ncpus=int(dp_ncpus), mem_gb=int(dp_mem_gb), walltime=dp_walltime,
+        ))
+
+        render_run_and_export(
+            key_prefix="destination",
+            local_script=dp_local_script, local_script_name="run_destination_prediction.py",
+            hpc_script=dp_hpc_script, hpc_script_name="run_destination_prediction.py",
+            pbs_script=dp_pbs_script, pbs_script_name=f"{dp_experiment_name}.pbs",
+            engine_python=engine_python,
+            data_file_to_bundle=dp_uploaded_path,
         )
