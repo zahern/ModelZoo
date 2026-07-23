@@ -106,10 +106,24 @@ class SearchLibriumConfig:
     maxiter: int = 2000
     criterion: str = "bic"         # bic | aic | loglik
     mae_enabled: bool = False      # add ("mae", -1) as a second criterion
+    mae_order: str = "criterion_first"    # criterion_first | mae_first -- which objective SearchLibrium treats as primary
     val_share: float = 0.25        # held-out share for the auto train/test split when mae_enabled
     algorithm: str = "sa"          # sa | hs | sapbil | banditsa | hspbil | parsa | parcopsa
     nthrds: int = 4                # only used by parsa/parcopsa
     seed: int = 1
+    # Stopping criteria (SA-family algorithms only -- sa/sapbil/banditsa;
+    # forwarded but silently unused by hs/hspbil, which have no equivalent
+    # kwargs -- confirmed directly against siman.py/harmony.py). None = use
+    # the algorithm's own default (max_total_iter=100000, max_time=no limit).
+    max_time: Optional[int] = None        # wall-clock seconds
+    max_total_iter: Optional[int] = None  # max SA temperature steps
+    # Manual algorithm hyperparameters (ctrl tuple) -- overrides
+    # estimate_ctrl()'s auto-estimation when set. Shape depends on the
+    # algorithm family (verified against call_meta.py's call_search
+    # docstring): SA-family (sa/sapbil/banditsa/parsa/parcopsa) takes
+    # (tI, tF, max_temp_steps, max_iter); HS-family (hs/hspbil) takes
+    # (max_mem, maxiter, max_harm, min_harm, max_pitch, min_pitch).
+    ctrl_override: Optional[tuple] = None
     nests_json: Optional[str] = None      # raw JSON text, only for nested_logit/mixed_nested
     lambdas_json: Optional[str] = None
     latent_class: bool = False
@@ -151,11 +165,21 @@ lambdas = {cfg.lambdas_json or '{}'}
         constraints_kwarg = "pre_spec_constraints = constraints.dict(),"
 
     if cfg.mae_enabled:
-        criterions_expr = f"[({cfg.criterion!r}, -1), ('mae', -1)]"
+        if cfg.mae_order == "mae_first":
+            criterions_expr = f"[('mae', -1), ({cfg.criterion!r}, -1)]"
+        else:
+            criterions_expr = f"[({cfg.criterion!r}, -1), ('mae', -1)]"
         val_share_kw = f"val_share    = {cfg.val_share!r},"
     else:
         criterions_expr = f"[({cfg.criterion!r}, -1)]"
         val_share_kw = ""
+
+    stopping_kwargs = ""
+    if cfg.max_time:
+        stopping_kwargs += f", max_time={cfg.max_time!r}"
+    if cfg.max_total_iter:
+        stopping_kwargs += f", max_total_iter={cfg.max_total_iter!r}"
+    ctrl_kwarg = f", ctrl={cfg.ctrl_override!r}" if cfg.ctrl_override else ""
 
     lc_kwargs = f"latent_class = True,\n    num_classes  = {cfg.num_classes!r}," if cfg.latent_class else ""
 
@@ -164,11 +188,12 @@ lambdas = {cfg.lambdas_json or '{}'}
         # call_parsa/call_parcopsa don't return anything (unlike every other
         # call_* wrapper) -- retrieve the best solution manually. Verified
         # against SearchLibrium source (call_meta.py, siman.py PARSA/PARCOPSA).
+        ctrl_line = f"ctrl = {cfg.ctrl_override!r}" if cfg.ctrl_override else 'ctrl = estimate_ctrl(params, algorithm="sa")'
         if cfg.algorithm == "parsa":
             sign_expr = "-1" if cfg.criterion in ("bic", "aic", "mae") else "1"
             run_block = f'''from SearchLibrium.siman import PARSA
 from SearchLibrium import estimate_ctrl
-ctrl = estimate_ctrl(params, algorithm="sa")
+{ctrl_line}
 parsa = PARSA(params, None, ctrl, nthrds={cfg.nthrds!r})
 parsa.run()
 _pick = min if {sign_expr} == -1 else max
@@ -177,12 +202,15 @@ best = _pick(candidates, key=lambda s: s[{cfg.criterion!r}])'''
         else:
             run_block = f'''from SearchLibrium.siman import PARCOPSA
 from SearchLibrium import estimate_ctrl
-ctrl = estimate_ctrl(params, algorithm="sa")
+{ctrl_line}
 parcopsa = PARCOPSA(params, None, ctrl, nthrds={cfg.nthrds!r})
 parcopsa.run()
 best = parcopsa.solvers[parcopsa.get_best()].best_sol'''
     else:
-        run_block = f"best = call_search(params, algorithm={cfg.algorithm!r}, id_num={cfg.seed!r})"
+        # max_time/max_total_iter: PARSA/PARCOPSA's constructor takes no
+        # **kwargs at all (confirmed against siman.py), so these only apply
+        # here, not in the is_parallel_sa branch above.
+        run_block = f"best = call_search(params, algorithm={cfg.algorithm!r}, id_num={cfg.seed!r}{stopping_kwargs}{ctrl_kwarg})"
 
     parallel_summary_block = ""
     if is_parallel_sa:
@@ -887,6 +915,29 @@ class MetaCountConfig:
     output_dir: str = "results"
     experiment_name: str = "metacount_run"
     search_description: str = ""
+    # Train/test split -- metacountregressor's ExperimentBuilder has no
+    # native out-of-sample scoring (confirmed against source: no predict()/
+    # score() method takes fixed coefficients + new data), so this splits
+    # the data ourselves and independently refits the *same* discovered
+    # structure on both subsets for a stability comparison, rather than true
+    # out-of-sample log-likelihood.
+    test_split_enabled: bool = False
+    test_share: float = 0.2
+    # Stopping criteria -- forwarded to AdvancedSimulatedAnnealing via
+    # builder.run()'s **algo_kwargs (confirmed against Solvers_METAJAX.py);
+    # algo='sa' only, no equivalent for de/hs.
+    max_time: Optional[int] = None        # wall-clock seconds
+    patience: Optional[int] = None        # iterations without improvement
+    # Algorithm hyperparameters -- forwarded verbatim as **algo_kwargs to
+    # builder.run(), which merges them into algorithm-specific defaults
+    # before constructing the solver (confirmed against
+    # experiment_package.py's run()/Solvers_METAJAX.py):
+    #   sa: T0 (float|None=auto), alpha (cooling rate), mutation_rate,
+    #       min_changes, max_changes, n_starts, archive_limit,
+    #       restart_threshold, tol
+    #   de: population_size, F, CR
+    #   hs: population_size, hmcr, par_min, par_max, bw_min, bw_max
+    algo_hyperparams: dict = field(default_factory=dict)
 
 
 def _constraints_code(c: ConstraintsConfig) -> str:
@@ -944,6 +995,63 @@ def generate_metacount_script(cfg: MetaCountConfig, for_hpc: bool) -> str:
         )
         constraints_warning = f"print({warn_msg!r})\n"
 
+    split_block = ""
+    train_df_name = "df"
+    if cfg.test_split_enabled:
+        train_df_name = "df_train"
+        split_block = f'''
+from sklearn.model_selection import train_test_split
+df_train, df_test = train_test_split(df, test_size={cfg.test_share!r}, random_state={cfg.seed!r})
+print(f"Train/test split: {{df_train.shape[0]}} train rows, {{df_test.shape[0]}} test rows")
+'''
+
+    # AdvancedSimulatedAnnealing's max_time/patience kwargs (via
+    # builder.run()'s **algo_kwargs) are algo='sa'-specific -- for de/hs
+    # they'd get force-merged into unrelated AdaptiveDE/DynamicHarmony kwarg
+    # dicts and crash with an unexpected-keyword-argument TypeError
+    # (confirmed against experiment_package.py's run() de/hs branch).
+    stopping_kwargs = ""
+    if cfg.algo == "sa":
+        # max_time/patience are AdvancedSimulatedAnnealing-only kwargs; for
+        # de/hs they'd get force-merged into unrelated AdaptiveDE/
+        # DynamicHarmony kwarg dicts and crash with an unexpected-keyword
+        # TypeError (confirmed against experiment_package.py's run()).
+        if cfg.max_time:
+            stopping_kwargs += f"\n    max_time={cfg.max_time!r},"
+        if cfg.patience:
+            stopping_kwargs += f"\n    patience={cfg.patience!r},"
+    # algo_hyperparams entries are algo-specific by construction (the GUI
+    # only populates keys valid for the currently-selected algorithm), so
+    # no per-algo gating needed here -- unlike max_time/patience above.
+    for _k, _v in cfg.algo_hyperparams.items():
+        stopping_kwargs += f"\n    {_k}={_v!r},"
+
+    test_eval_block = ""
+    if cfg.test_split_enabled:
+        # metacountregressor has no out-of-sample scoring API (no predict()/
+        # score() taking fixed coefficients + new data) -- independently
+        # refit the same discovered structure on the held-out test rows
+        # instead, for a stability comparison rather than true out-of-sample
+        # log-likelihood.
+        test_eval_block = f'''
+print("\\nRefitting the same best structure on the held-out test split for comparison...")
+test_builder = ExperimentBuilder(
+    df=df_test,
+    id_col={cfg.id_col!r},
+    y_col={cfg.y_col!r},
+    {offset_kw}
+    {group_kw}
+)
+train_vs_test = {{}}
+for family in fit_families:
+    train_vs_test[f"{{family}}_train"] = fits[family]
+    train_vs_test[f"{{family}}_test"] = test_builder.fit_manual_model(manual_spec=best_spec, model=family, R={cfg.final_r_draws!r})
+print("\\nTrain vs. test structure-stability comparison (same specification, refit on each subset):")
+comparison_tt = compare_models(train_vs_test)
+print(comparison_tt.to_string(index=False))
+comparison_tt.to_csv(out_dir / ({cfg.experiment_name!r} + "_train_vs_test.csv"), index=False)
+'''
+
     return f'''"""Auto-generated by ModelZoo GUI — metacountregressor search run: {cfg.experiment_name}
 
 Run locally:
@@ -974,14 +1082,14 @@ print("=" * 70)
 t0 = time.time()
 {load_block}
 print(f"Loaded data: {{df.shape[0]}} rows x {{df.shape[1]}} cols")
-
+{split_block}
 constraints = (
     {constraints_code}
 )
 print(constraints)
 {constraints_warning}
 builder = ExperimentBuilder(
-    df=df,
+    df={train_df_name},
     id_col={cfg.id_col!r},
     y_col={cfg.y_col!r},
     {offset_kw}
@@ -1016,7 +1124,7 @@ result = builder.run(
     algo={cfg.algo!r},
     max_iter={cfg.max_iter!r},
     seed={cfg.seed!r},
-    output_config=output_config,
+    output_config=output_config,{stopping_kwargs}
 )
 
 elapsed = time.time() - t0
@@ -1044,7 +1152,7 @@ if len(fits) > 1:
     comparison = compare_models(fits)
     print(comparison.to_string(index=False))
     comparison.to_csv(out_dir / ({cfg.experiment_name!r} + "_family_comparison.csv"), index=False)
-'''
+{test_eval_block}'''
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1081,11 +1189,23 @@ class CMFConfig:
     output_dir: str = "results"
     experiment_name: str = "cmf_run"
     search_description: str = ""
+    use_bundled: bool = False       # metacountregressor's load_example_crash_data() (has an AADT column)
+    # Train/test split + stopping criteria (JAX mode only -- see the same
+    # notes on MetaCountConfig above; identical mechanics since JAX mode
+    # goes through the same builder.run()/fit_manual_model() flow).
+    test_split_enabled: bool = False
+    test_share: float = 0.2
+    max_time: Optional[int] = None
+    patience: Optional[int] = None
+    algo_hyperparams: dict = field(default_factory=dict)   # see MetaCountConfig.algo_hyperparams
 
 
 def generate_cmf_script(cfg: CMFConfig, for_hpc: bool) -> str:
-    data_expr = repr(cfg.hpc_data_filename) if for_hpc else repr(cfg.data_path)
-    load_block = f"df = pd.read_csv({data_expr})"
+    if cfg.use_bundled:
+        load_block = "from metacountregressor import load_example_crash_data\ndf = load_example_crash_data()"
+    else:
+        data_expr = repr(cfg.hpc_data_filename) if for_hpc else repr(cfg.data_path)
+        load_block = f"df = pd.read_csv({data_expr})"
 
     if cfg.search_mode == "ga":
         return f'''"""Auto-generated by ModelZoo GUI — CMF (GA search) run: {cfg.experiment_name}
@@ -1153,6 +1273,64 @@ print(f"Saved CMF interpretation table to {{out_dir}}")
     offset_kw = f"offset_col={cfg.offset_col!r}," if cfg.offset_col else ""
     group_kw = f"group_id_col={cfg.group_id_col!r}," if cfg.group_id_col else ""
 
+    split_block = ""
+    cmf_df_name = "df"
+    if cfg.test_split_enabled:
+        cmf_df_name = "df_train"
+        split_block = f'''
+from sklearn.model_selection import train_test_split
+df_train, df_test = train_test_split(df, test_size={cfg.test_share!r}, random_state={cfg.seed!r})
+print(f"Train/test split: {{df_train.shape[0]}} train rows, {{df_test.shape[0]}} test rows")
+'''
+
+    stopping_kwargs = ""
+    if cfg.algo == "sa":
+        # max_time/patience are AdvancedSimulatedAnnealing-only kwargs; for
+        # de/hs they'd get force-merged into unrelated AdaptiveDE/
+        # DynamicHarmony kwarg dicts and crash with an unexpected-keyword
+        # TypeError (confirmed against experiment_package.py's run()).
+        if cfg.max_time:
+            stopping_kwargs += f"\n    max_time={cfg.max_time!r},"
+        if cfg.patience:
+            stopping_kwargs += f"\n    patience={cfg.patience!r},"
+    # algo_hyperparams entries are algo-specific by construction (the GUI
+    # only populates keys valid for the currently-selected algorithm), so
+    # no per-algo gating needed here -- unlike max_time/patience above.
+    for _k, _v in cfg.algo_hyperparams.items():
+        stopping_kwargs += f"\n    {_k}={_v!r},"
+
+    test_eval_block = ""
+    if cfg.test_split_enabled:
+        test_eval_block = f'''
+print("\\nRefitting the same best structure on the held-out test split for comparison...")
+cmf_test = CMFExperimentBuilder(
+    df=df_test,
+    y_col={cfg.y_col!r},
+    aadt_col={cfg.aadt_col!r},
+    baseline_vars={_pylist(cfg.baseline_vars)},
+    local_vars={_pylist(cfg.local_vars)},
+)
+test_builder, test_evaluator, _test_metadata = cmf_test.build_jax_count_evaluator(
+    id_col={cfg.id_col!r},
+    {offset_kw}
+    {group_kw}
+    variables={_pylist(aux_vars)},
+    constraints=constraints,
+    max_latent_classes={cfg.max_latent_classes!r},
+    R={cfg.r_draws!r},
+    default_roles={cfg.default_roles!r},
+    force_aadt_term={cfg.force_aadt_term!r},
+)
+train_vs_test = {{}}
+for family in fit_families:
+    train_vs_test[f"{{family}}_train"] = fits[family]
+    train_vs_test[f"{{family}}_test"] = test_builder.fit_manual_model(manual_spec=best_spec, model=family, R={cfg.final_r_draws!r})
+print("\\nTrain vs. test structure-stability comparison (same specification, refit on each subset):")
+comparison_tt = compare_models(train_vs_test)
+print(comparison_tt.to_string(index=False))
+comparison_tt.to_csv(out_dir / ({cfg.experiment_name!r} + "_train_vs_test.csv"), index=False)
+'''
+
     return f'''"""Auto-generated by ModelZoo GUI — CMF (JAX flexible search) run: {cfg.experiment_name}
 
 Run locally:
@@ -1188,14 +1366,14 @@ print("=" * 70)
 t0 = time.time()
 {load_block}
 print(f"Loaded data: {{df.shape[0]}} rows x {{df.shape[1]}} cols")
-
+{split_block}
 constraints = (
     {constraints_code}
 )
 print(constraints)
 
 cmf = CMFExperimentBuilder(
-    df=df,
+    df={cmf_df_name},
     y_col={cfg.y_col!r},
     aadt_col={cfg.aadt_col!r},
     baseline_vars={_pylist(cfg.baseline_vars)},
@@ -1228,7 +1406,7 @@ result = builder.run(
     algo={cfg.algo!r},
     max_iter={cfg.max_iter!r},
     seed={cfg.seed!r},
-    output_config=output_config,
+    output_config=output_config,{stopping_kwargs}
 )
 
 elapsed = time.time() - t0
@@ -1256,7 +1434,7 @@ if len(fits) > 1:
     comparison = compare_models(fits)
     print(comparison.to_string(index=False))
     comparison.to_csv(out_dir / ({cfg.experiment_name!r} + "_family_comparison.csv"), index=False)
-'''
+{test_eval_block}'''
 
 
 # ─────────────────────────────────────────────────────────────────────────────

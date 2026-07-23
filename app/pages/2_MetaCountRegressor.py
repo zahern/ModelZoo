@@ -164,6 +164,81 @@ with tab_count:
         seed = st.number_input("Seed", 0, 999999, 42)
     final_r_draws = st.number_input("Final refit Halton draws (R)", 50, 5000, 500, step=50)
 
+    st.subheader("6b. Train/test split & stopping criteria")
+    c1, c2 = st.columns(2)
+    with c1:
+        test_split_enabled = st.checkbox("Enable train/test split", key="mc_split_on")
+        test_share = st.number_input(
+            "Test share", 0.05, 0.5, 0.2, step=0.05, disabled=not test_split_enabled, key="mc_test_share",
+        )
+        st.caption(
+            "metacountregressor has no out-of-sample scoring API (confirmed against source — no "
+            "predict()/score() taking fixed coefficients + new data), so this splits the data and "
+            "independently refits the *same* discovered structure on train vs. test, as a "
+            "stability check — not true out-of-sample log-likelihood."
+        )
+    with c2:
+        max_time_enabled = st.checkbox("Limit by wall-clock time", disabled=algo != "sa", key="mc_maxtime_on")
+        max_time = st.number_input(
+            "Max seconds", 10, 86400, 3600, step=60, disabled=not max_time_enabled or algo != "sa", key="mc_maxtime",
+        ) if max_time_enabled else None
+        patience_enabled = st.checkbox("Stop after N iterations with no improvement", disabled=algo != "sa", key="mc_patience_on")
+        patience = st.number_input(
+            "Patience (iterations)", 10, 100000, 400, step=10, disabled=not patience_enabled or algo != "sa", key="mc_patience",
+        ) if patience_enabled else None
+        if algo != "sa":
+            st.caption("Stopping criteria only apply to algo='sa' — de/hs would crash on these extra kwargs (confirmed against source).")
+
+    st.subheader("6c. Algorithm hyperparameters")
+    algo_hyperparams: dict = {}
+    if algo == "sa":
+        st.caption("Forwarded to AdvancedSimulatedAnnealing — verified against Solvers_METAJAX.py.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            mc_t0_enabled = st.checkbox("Set initial temperature (T0)", key="mc_t0_on")
+            mc_t0 = st.number_input("T0", 0.001, 1e7, 100.0, key="mc_t0", disabled=not mc_t0_enabled)
+            mc_alpha = st.number_input("Cooling rate (alpha)", 0.5, 0.9999, 0.995, format="%.4f", key="mc_alpha")
+        with c2:
+            mc_n_starts = st.number_input("Parallel restarts (n_starts)", 1, 50, 1, key="mc_n_starts")
+            mc_mutation_rate = st.number_input("Mutation rate", 0.01, 1.0, 0.3, key="mc_mut_rate")
+        with c3:
+            mc_min_changes = st.number_input("Min changes per move", 1, 20, 1, key="mc_min_changes")
+            mc_max_changes = st.number_input("Max changes per move", 1, 20, 3, key="mc_max_changes")
+        algo_hyperparams = {
+            "alpha": float(mc_alpha), "n_starts": int(mc_n_starts),
+            "mutation_rate": float(mc_mutation_rate),
+            "min_changes": int(mc_min_changes), "max_changes": int(mc_max_changes),
+        }
+        if mc_t0_enabled:
+            algo_hyperparams["T0"] = float(mc_t0)
+    elif algo == "de":
+        st.caption("Forwarded to AdaptiveDE — verified against Solvers_METAJAX.py.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            mc_pop_size = st.number_input("Population size", 4, 500, 20, key="mc_de_pop")
+        with c2:
+            mc_F = st.number_input("Mutation factor (F)", 0.0, 2.0, 0.5, key="mc_de_F")
+        with c3:
+            mc_CR = st.number_input("Crossover rate (CR)", 0.0, 1.0, 0.7, key="mc_de_CR")
+        algo_hyperparams = {"population_size": int(mc_pop_size), "F": float(mc_F), "CR": float(mc_CR)}
+    else:  # hs
+        st.caption("Forwarded to DynamicHarmony — verified against Solvers_METAJAX.py.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            mc_hs_pop = st.number_input("Harmony memory size (population)", 4, 500, 20, key="mc_hs_pop")
+            mc_hmcr = st.number_input("Harmony memory consideration rate (hmcr)", 0.0, 1.0, 0.9, key="mc_hmcr")
+        with c2:
+            mc_par_min = st.number_input("Min pitch adjustment rate", 0.0, 1.0, 0.1, key="mc_par_min")
+            mc_par_max = st.number_input("Max pitch adjustment rate", 0.0, 1.0, 0.9, key="mc_par_max")
+        with c3:
+            mc_bw_min = st.number_input("Min bandwidth", 0.0, 100.0, 1.0, key="mc_bw_min")
+            mc_bw_max = st.number_input("Max bandwidth", 0.0, 100.0, 3.0, key="mc_bw_max")
+        algo_hyperparams = {
+            "population_size": int(mc_hs_pop), "hmcr": float(mc_hmcr),
+            "par_min": float(mc_par_min), "par_max": float(mc_par_max),
+            "bw_min": float(mc_bw_min), "bw_max": float(mc_bw_max),
+        }
+
     st.subheader("7. Job naming & output")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -212,6 +287,10 @@ with tab_count:
             fit_model_families=fit_model_families or [fit_family_options[0]], final_r_draws=int(final_r_draws),
             output_dir=output_dir, experiment_name=experiment_name,
             search_description=search_description,
+            test_split_enabled=bool(test_split_enabled), test_share=float(test_share),
+            max_time=int(max_time) if max_time else None,
+            patience=int(patience) if patience else None,
+            algo_hyperparams=algo_hyperparams,
         )
 
         local_script = generate_metacount_script(cfg, for_hpc=False)
@@ -240,12 +319,25 @@ with tab_cmf:
 
     st.subheader("1. Data")
     cmf_data_choice = st.radio(
-        "Data source", ["Upload CSV", "Path on disk"], horizontal=True, key="cmf_data_choice",
+        "Data source", ["Bundled example dataset", "Upload CSV", "Path on disk"], horizontal=True, key="cmf_data_choice",
     )
     cmf_df: pd.DataFrame | None = None
     cmf_data_path = ""
     cmf_uploaded_path: Path | None = None
-    if cmf_data_choice == "Upload CSV":
+    cmf_use_bundled = False
+    if cmf_data_choice == "Bundled example dataset":
+        cmf_use_bundled = True
+        st.info(
+            "Will load via `metacountregressor.load_example_crash_data()` at run time — crash-frequency "
+            "data with an AADT column (34 columns, y_col='FREQ', aadt_col='AADT', id_col='ID')."
+        )
+        cmf_columns = [
+            "ID", "FREQ", "LENGTH", "INCLANES", "DECLANES", "WIDTH", "MIMEDSH", "MXMEDSH", "SPEED", "URB",
+            "FC", "AADT", "SINGLE", "DOUBLE", "TRAIN", "PEAKHR", "GRADEBR", "MIGRADE", "MXGRADE", "MXGRDIFF",
+            "TANGENT", "CURVES", "MINRAD", "ACCESS", "MEDWIDTH", "FRICTION", "ADTLANE", "SLOPE", "INTECHAG",
+            "AVEPRE", "AVESNOW", "OFFSET", "FC_ENCODED", "FC_LABEL",
+        ]
+    elif cmf_data_choice == "Upload CSV":
         cmf_up = st.file_uploader("CSV file", type=["csv"], key="cmf_upload")
         if cmf_up is not None:
             cmf_job_dir = Path(__file__).resolve().parent.parent.parent / "generated_jobs" / "_uploads"
@@ -272,9 +364,11 @@ with tab_cmf:
     st.subheader("2. Column mapping")
     c1, c2 = st.columns(2)
     with c1:
-        cmf_y_col = st.selectbox("Outcome (crash count) column", cmf_columns, key="cmf_y") if cmf_columns else st.text_input("Outcome column", "FREQ", key="cmf_y_text")
+        cmf_y_default = cmf_columns.index("FREQ") if "FREQ" in cmf_columns else 0
+        cmf_y_col = st.selectbox("Outcome (crash count) column", cmf_columns, index=cmf_y_default, key="cmf_y") if cmf_columns else st.text_input("Outcome column", "FREQ", key="cmf_y_text")
     with c2:
-        cmf_aadt_col = st.selectbox("AADT (traffic volume) column", cmf_columns, key="cmf_aadt") if cmf_columns else st.text_input("AADT column", "AADT", key="cmf_aadt_text")
+        cmf_aadt_default = cmf_columns.index("AADT") if "AADT" in cmf_columns else 0
+        cmf_aadt_col = st.selectbox("AADT (traffic volume) column", cmf_columns, index=cmf_aadt_default, key="cmf_aadt") if cmf_columns else st.text_input("AADT column", "AADT", key="cmf_aadt_text")
 
     st.subheader("3. Baseline / local variable structure")
     st.caption(
@@ -295,7 +389,7 @@ with tab_cmf:
     cmf_search_mode_label = st.radio(
         "Search mode",
         ["GA search (original CMF method + interpretation table)", "JAX flexible search (full constraints + latent classes)"],
-        key="cmf_mode",
+        index=1, key="cmf_mode",
     )
     cmf_search_mode = "ga" if cmf_search_mode_label.startswith("GA") else "jax"
 
@@ -315,6 +409,11 @@ with tab_cmf:
     cmf_final_r_draws = 500
     cmf_ga_R = 200
     cmf_ga_final_R = 500
+    cmf_test_split_enabled = False
+    cmf_test_share = 0.2
+    cmf_max_time = None
+    cmf_patience = None
+    cmf_algo_hyperparams: dict = {}
 
     if cmf_search_mode == "ga":
         c1, c2 = st.columns(2)
@@ -356,7 +455,8 @@ with tab_cmf:
         st.markdown("**Search structure**")
         c1, c2, c3 = st.columns(3)
         with c1:
-            cmf_id_col = st.selectbox("ID column", cmf_columns, key="cmf_id_col") if cmf_columns else st.text_input("ID column", "id", key="cmf_id_col_text")
+            cmf_id_default = cmf_columns.index("ID") if "ID" in cmf_columns else 0
+            cmf_id_col = st.selectbox("ID column", cmf_columns, index=cmf_id_default, key="cmf_id_col") if cmf_columns else st.text_input("ID column", "id", key="cmf_id_col_text")
             offset_opts = ["(none)"] + cmf_columns
             cmf_offset_col = st.selectbox("Offset column (optional)", offset_opts, key="cmf_offset_col")
             cmf_offset_col = None if cmf_offset_col == "(none)" else cmf_offset_col
@@ -387,6 +487,74 @@ with tab_cmf:
         )
         cmf_final_r_draws = st.number_input("Final refit Halton draws (R)", 50, 5000, 500, step=50, key="cmf_final_r")
 
+        st.markdown("**Train/test split & stopping criteria**")
+        c1, c2 = st.columns(2)
+        with c1:
+            cmf_test_split_enabled = st.checkbox("Enable train/test split", key="cmf_split_on")
+            cmf_test_share = st.number_input(
+                "Test share", 0.05, 0.5, 0.2, step=0.05, disabled=not cmf_test_split_enabled, key="cmf_test_share",
+            )
+        with c2:
+            cmf_max_time_enabled = st.checkbox("Limit by wall-clock time", disabled=cmf_algo != "sa", key="cmf_maxtime_on")
+            cmf_max_time = st.number_input(
+                "Max seconds", 10, 86400, 3600, step=60, disabled=not cmf_max_time_enabled or cmf_algo != "sa", key="cmf_maxtime",
+            ) if cmf_max_time_enabled else None
+            cmf_patience_enabled = st.checkbox("Stop after N iterations with no improvement", disabled=cmf_algo != "sa", key="cmf_patience_on")
+            cmf_patience = st.number_input(
+                "Patience (iterations)", 10, 100000, 400, step=10, disabled=not cmf_patience_enabled or cmf_algo != "sa", key="cmf_patience",
+            ) if cmf_patience_enabled else None
+        if cmf_algo != "sa":
+            st.caption("Stopping criteria only apply to algo='sa' — de/hs would crash on these extra kwargs (confirmed against source).")
+
+        st.markdown("**Algorithm hyperparameters**")
+        if cmf_algo == "sa":
+            st.caption("Forwarded to AdvancedSimulatedAnnealing — verified against Solvers_METAJAX.py.")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                cmf_t0_enabled = st.checkbox("Set initial temperature (T0)", key="cmf_t0_on")
+                cmf_t0 = st.number_input("T0", 0.001, 1e7, 100.0, key="cmf_t0", disabled=not cmf_t0_enabled)
+                cmf_alpha = st.number_input("Cooling rate (alpha)", 0.5, 0.9999, 0.995, format="%.4f", key="cmf_alpha")
+            with c2:
+                cmf_n_starts = st.number_input("Parallel restarts (n_starts)", 1, 50, 1, key="cmf_n_starts")
+                cmf_mutation_rate = st.number_input("Mutation rate", 0.01, 1.0, 0.3, key="cmf_mut_rate")
+            with c3:
+                cmf_min_changes = st.number_input("Min changes per move", 1, 20, 1, key="cmf_min_changes")
+                cmf_max_changes = st.number_input("Max changes per move", 1, 20, 3, key="cmf_max_changes")
+            cmf_algo_hyperparams = {
+                "alpha": float(cmf_alpha), "n_starts": int(cmf_n_starts),
+                "mutation_rate": float(cmf_mutation_rate),
+                "min_changes": int(cmf_min_changes), "max_changes": int(cmf_max_changes),
+            }
+            if cmf_t0_enabled:
+                cmf_algo_hyperparams["T0"] = float(cmf_t0)
+        elif cmf_algo == "de":
+            st.caption("Forwarded to AdaptiveDE — verified against Solvers_METAJAX.py.")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                cmf_de_pop = st.number_input("Population size", 4, 500, 20, key="cmf_de_pop")
+            with c2:
+                cmf_de_F = st.number_input("Mutation factor (F)", 0.0, 2.0, 0.5, key="cmf_de_F")
+            with c3:
+                cmf_de_CR = st.number_input("Crossover rate (CR)", 0.0, 1.0, 0.7, key="cmf_de_CR")
+            cmf_algo_hyperparams = {"population_size": int(cmf_de_pop), "F": float(cmf_de_F), "CR": float(cmf_de_CR)}
+        else:  # hs
+            st.caption("Forwarded to DynamicHarmony — verified against Solvers_METAJAX.py.")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                cmf_hs_pop = st.number_input("Harmony memory size (population)", 4, 500, 20, key="cmf_hs_pop")
+                cmf_hmcr = st.number_input("Harmony memory consideration rate (hmcr)", 0.0, 1.0, 0.9, key="cmf_hmcr")
+            with c2:
+                cmf_par_min = st.number_input("Min pitch adjustment rate", 0.0, 1.0, 0.1, key="cmf_par_min")
+                cmf_par_max = st.number_input("Max pitch adjustment rate", 0.0, 1.0, 0.9, key="cmf_par_max")
+            with c3:
+                cmf_bw_min = st.number_input("Min bandwidth", 0.0, 100.0, 1.0, key="cmf_bw_min")
+                cmf_bw_max = st.number_input("Max bandwidth", 0.0, 100.0, 3.0, key="cmf_bw_max")
+            cmf_algo_hyperparams = {
+                "population_size": int(cmf_hs_pop), "hmcr": float(cmf_hmcr),
+                "par_min": float(cmf_par_min), "par_max": float(cmf_par_max),
+                "bw_min": float(cmf_bw_min), "bw_max": float(cmf_bw_max),
+            }
+
     st.subheader("5. Job naming & output")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -406,7 +574,8 @@ with tab_cmf:
 
     st.divider()
 
-    cmf_ready = bool(cmf_y_col and cmf_aadt_col and (cmf_baseline_vars or cmf_local_vars) and (cmf_df is not None))
+    cmf_has_data = cmf_use_bundled or cmf_df is not None
+    cmf_ready = bool(cmf_y_col and cmf_aadt_col and (cmf_baseline_vars or cmf_local_vars) and cmf_has_data)
     if not cmf_ready:
         st.warning("Select data, the AADT/outcome columns, and at least one baseline or local variable to generate a script.")
     else:
@@ -415,7 +584,7 @@ with tab_cmf:
             data_path=cmf_data_path, hpc_data_filename=cmf_hpc_data_filename,
             y_col=cmf_y_col, aadt_col=cmf_aadt_col,
             baseline_vars=cmf_baseline_vars, local_vars=cmf_local_vars,
-            search_mode=cmf_search_mode,
+            search_mode=cmf_search_mode, use_bundled=cmf_use_bundled,
             ga_R=int(cmf_ga_R), ga_final_R=int(cmf_ga_final_R),
             id_col=cmf_id_col, offset_col=cmf_offset_col, group_id_col=cmf_group_id_col,
             variables=cmf_variables, constraints=cmf_constraints_cfg,
@@ -425,6 +594,10 @@ with tab_cmf:
             fit_model_families=cmf_fit_families or ["nb"], final_r_draws=int(cmf_final_r_draws),
             output_dir=cmf_output_dir, experiment_name=cmf_experiment_name,
             search_description=cmf_search_description,
+            test_split_enabled=bool(cmf_test_split_enabled), test_share=float(cmf_test_share),
+            max_time=int(cmf_max_time) if cmf_max_time else None,
+            patience=int(cmf_patience) if cmf_patience else None,
+            algo_hyperparams=cmf_algo_hyperparams,
         )
 
         cmf_local_script = generate_cmf_script(cmf_cfg, for_hpc=False)

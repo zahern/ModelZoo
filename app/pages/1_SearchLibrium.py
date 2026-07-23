@@ -168,7 +168,12 @@ with tab_search:
             help="Auto-splits the data into train/test by individual (val_share below) unless "
                  "you're already passing your own held-out set — see SearchLibrium's Parameters(df_test=...).",
         )
-        val_share = st.number_input("Held-out share for MAE", 0.05, 0.5, 0.25, step=0.05, disabled=not mae_enabled)
+        mae_order_label = st.radio(
+            "Objective order", [f"{criterion.upper()} first, MAE second", f"MAE first, {criterion.upper()} second"],
+            disabled=not mae_enabled, horizontal=True,
+            help="Which objective SearchLibrium treats as primary (1st) vs secondary (2nd) when ranking solutions.",
+        )
+        mae_order = "mae_first" if mae_order_label.startswith("MAE") else "criterion_first"
     with c2:
         allow_random = st.checkbox("Allow random parameters", value="mixed_logit" in models or "mixed_random_regret" in models or "mixed_nested" in models)
         allow_bcvars = st.checkbox("Allow Box-Cox transforms")
@@ -197,6 +202,72 @@ with tab_search:
         st.caption("Nested/mixed-nested logit require nest structure, e.g. `{\"PublicTransport\": [0, 1], \"Private\": [2, 3]}`")
         nests_json = st.text_area("nests (JSON)", value='{"nest_1": [0, 1]}')
         lambdas_json = st.text_area("lambdas (JSON)", value='{"nest_1": 0.8}')
+
+    st.subheader("5b. Train/test split & stopping criteria")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        val_share = st.number_input(
+            "Held-out share for MAE (train/test split)", 0.05, 0.5, 0.25, step=0.05, disabled=not mae_enabled,
+            help="Only takes effect when 'Add MAE as a second objective' above is checked — SearchLibrium's "
+                 "auto-split (val_share) is triggered specifically by MAE being an active objective (verified "
+                 "against source: Parameters only builds df_test when mae_is_an_objective() is true).",
+        )
+    with c2:
+        max_time_enabled = st.checkbox("Limit by wall-clock time", key="sl_maxtime_on")
+        max_time = st.number_input(
+            "Max seconds", 10, 86400, 3600, step=60, disabled=not max_time_enabled, key="sl_maxtime",
+        ) if max_time_enabled else None
+    with c3:
+        max_total_iter_enabled = st.checkbox("Limit SA search steps", key="sl_maxsteps_on")
+        max_total_iter = st.number_input(
+            "Max temperature steps", 10, 1000000, 500, step=50, disabled=not max_total_iter_enabled, key="sl_maxsteps",
+        ) if max_total_iter_enabled else None
+    st.caption(
+        "Both stopping-criteria controls only take effect for SA-family algorithms (sa/sapbil/banditsa) — "
+        "confirmed directly against source: Harmony Search (hs/hspbil) has no equivalent kwargs, and "
+        "parsa/parcopsa's constructor doesn't forward extra kwargs to its underlying SA solvers at all. "
+        "SearchLibrium's SA has no 'stop after N iterations with no improvement' option — only wall-clock "
+        "time and a hard step cap are supported natively."
+    )
+
+    st.subheader("5c. Algorithm hyperparameters")
+    is_sa_family = algorithm in ("sa", "sapbil", "banditsa", "parsa", "parcopsa")
+    is_hs_family = algorithm in ("hs", "hspbil")
+    ctrl_override = None
+    manual_ctrl = st.checkbox(
+        "Manually set hyperparameters (otherwise auto-estimated from problem size via estimate_ctrl())",
+        key="sl_manual_ctrl",
+    )
+    if manual_ctrl and is_sa_family:
+        st.caption("SA ctrl = (tI, tF, max_temp_steps, max_iter) — verified against call_meta.py's call_search docstring.")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            ctrl_tI = st.number_input("Initial temperature (tI)", 0.001, 1e7, 500.0, key="sl_ctrl_tI")
+        with c2:
+            ctrl_tF = st.number_input("Final temperature (tF)", 1e-6, 100.0, 0.01, format="%.6f", key="sl_ctrl_tF")
+        with c3:
+            ctrl_max_temp_steps = st.number_input("Cooling steps", 1, 100000, 100, key="sl_ctrl_steps")
+        with c4:
+            ctrl_max_iter = st.number_input("Evaluations per step", 1, 10000, 20, key="sl_ctrl_iter")
+        ctrl_override = (float(ctrl_tI), float(ctrl_tF), int(ctrl_max_temp_steps), int(ctrl_max_iter))
+    elif manual_ctrl and is_hs_family:
+        st.caption("HS ctrl = (max_mem, maxiter, max_harm, min_harm, max_pitch, min_pitch) — verified against call_meta.py.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            ctrl_max_mem = st.number_input("Harmony memory size (max_mem)", 2, 1000, 20, key="sl_ctrl_mem")
+            ctrl_hs_maxiter = st.number_input("Max iterations", 1, 100000, 400, key="sl_ctrl_hsiter")
+        with c2:
+            ctrl_max_harm = st.number_input("Max harmony consideration rate", 0.0, 1.0, 0.9, key="sl_ctrl_maxharm")
+            ctrl_min_harm = st.number_input("Min harmony consideration rate", 0.0, 1.0, 0.6, key="sl_ctrl_minharm")
+        with c3:
+            ctrl_max_pitch = st.number_input("Max pitch adjustment rate", 0.0, 1.0, 0.85, key="sl_ctrl_maxpitch")
+            ctrl_min_pitch = st.number_input("Min pitch adjustment rate", 0.0, 1.0, 0.3, key="sl_ctrl_minpitch")
+        ctrl_override = (
+            int(ctrl_max_mem), int(ctrl_hs_maxiter), float(ctrl_max_harm),
+            float(ctrl_min_harm), float(ctrl_max_pitch), float(ctrl_min_pitch),
+        )
+    elif manual_ctrl:
+        st.caption(f"No manual ctrl shape known for algorithm={algorithm!r} — falling back to auto-estimation.")
 
     st.subheader("6. Job naming & output")
     c1, c2, c3 = st.columns(3)
@@ -229,8 +300,11 @@ with tab_search:
             asvarnames=asvarnames, isvarnames=isvarnames,
             models=models, allow_random=allow_random, allow_bcvars=allow_bcvars,
             allow_corvars=allow_corvars, p_val=p_val, n_draws=int(n_draws), maxiter=int(maxiter),
-            criterion=criterion, mae_enabled=mae_enabled, val_share=val_share,
+            criterion=criterion, mae_enabled=mae_enabled, mae_order=mae_order, val_share=val_share,
             algorithm=algorithm, nthrds=int(nthrds), seed=int(seed),
+            max_time=int(max_time) if max_time else None,
+            max_total_iter=int(max_total_iter) if max_total_iter else None,
+            ctrl_override=ctrl_override,
             nests_json=nests_json, lambdas_json=lambdas_json,
             latent_class=latent_class, num_classes=int(num_classes),
             output_dir=output_dir, experiment_name=experiment_name,
