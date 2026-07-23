@@ -1131,7 +1131,16 @@ elapsed = time.time() - t0
 best = extract_search_best(result)
 print(f"\\nSearch finished in {{elapsed:.1f}}s")
 print("Best BIC:", best["best_bic"])
-print("Saved to:", result.get("saved_to"))
+print("Saved to:", result.get("saved_to"), "(full run metadata: hyperparameters, variables, objective, timing)")
+_stats_csv = result.get("stats_csv")
+# algo='sa' returns a list (one CSV per restart/n_starts); algo='de'/'hs'
+# returns a single path string -- normalise before iterating (iterating a
+# bare string would print one line per character).
+if isinstance(_stats_csv, str):
+    _stats_csv = [_stats_csv]
+for _csv in _stats_csv or []:
+    if _csv:
+        print("Best-so-far trace CSV:", _csv)
 
 best_spec = evaluator.build_spec(best["best_decision"])
 out_dir = Path({cfg.output_dir!r})
@@ -1413,7 +1422,16 @@ elapsed = time.time() - t0
 best = extract_search_best(result)
 print(f"\\nSearch finished in {{elapsed:.1f}}s")
 print("Best BIC:", best["best_bic"])
-print("Saved to:", result.get("saved_to"))
+print("Saved to:", result.get("saved_to"), "(full run metadata: hyperparameters, variables, objective, timing)")
+_stats_csv = result.get("stats_csv")
+# algo='sa' returns a list (one CSV per restart/n_starts); algo='de'/'hs'
+# returns a single path string -- normalise before iterating (iterating a
+# bare string would print one line per character).
+if isinstance(_stats_csv, str):
+    _stats_csv = [_stats_csv]
+for _csv in _stats_csv or []:
+    if _csv:
+        print("Best-so-far trace CSV:", _csv)
 
 best_spec = evaluator.build_spec(best["best_decision"])
 out_dir = Path({cfg.output_dir!r})
